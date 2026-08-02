@@ -1,0 +1,16 @@
+{
+  "name": "synthetic-signal-monitor",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "Always-on monitor that watches Deriv synthetic indices and sends Telegram alerts on trade signals.",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  }
+}
