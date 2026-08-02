@@ -8,7 +8,10 @@ import http from 'http';
 // ---- Config (set these as environment variables in your host) ----
 const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN;
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
-const APP_ID = process.env.DERIV_APP_ID || '1089'; // public demo app id
+// Deriv now returns an empty instrument list to unauthenticated connections,
+// so a read-scope API token is required for any market data.
+const DERIV_TOKEN = process.env.DERIV_TOKEN;
+const APP_ID = process.env.DERIV_APP_ID || '1089';
 const CONFIDENCE_THRESHOLD = Number(process.env.CONFIDENCE_THRESHOLD || 70);
 const GRANULARITY = Number(process.env.GRANULARITY_SECONDS || 900); // 900 = M15
 const ALERT_COOLDOWN_MS = Number(process.env.ALERT_COOLDOWN_MINUTES || 15) * 60 * 1000;
@@ -91,10 +94,9 @@ function atr(candles, period = 14) {
 }
 
 // ---- Per-symbol state ----
+// Keyed by the symbol code Deriv actually accepts, which is resolved at runtime.
 const state = {};
-SYMBOLS.forEach((s) => (state[s.code] = {
-  candles: [], lastDirection: null, lastConfidence: 0, lastAlertAt: 0,
-}));
+const labels = {};
 
 function evaluateSignal(code, label) {
   const st = state[code];
@@ -134,6 +136,59 @@ function evaluateSignal(code, label) {
 // ---- Deriv WebSocket connection with auto-reconnect ----
 let ws;
 let reconnectDelay = 3000;
+let activeSymbols = []; // resolved from Deriv after authorize
+
+// Ask Deriv what actually exists, rather than assuming symbol codes.
+function requestSymbols() {
+  ws.send(JSON.stringify({ active_symbols: 'brief' }));
+}
+
+// Match our watchlist against what Deriv really offers. Falls back to
+// display-name matching when a hardcoded code has been renamed.
+function resolveWatchlist(available) {
+  const byCode = new Map(available.map((s) => [s.symbol, s]));
+  const resolved = [];
+  const missing = [];
+
+  for (const want of SYMBOLS) {
+    if (byCode.has(want.code)) {
+      resolved.push({ code: want.code, label: want.label });
+      continue;
+    }
+    // e.g. "BOOM1000" -> look for a display name containing "boom" and "1000"
+    const parts = want.code.toLowerCase().match(/[a-z]+|\d+/g) || [];
+    const hit = available.find((s) => {
+      const name = (s.display_name || '').toLowerCase().replace(/\s+/g, '');
+      return parts.every((p) => name.includes(p));
+    });
+    if (hit) {
+      console.log(`Remapped ${want.code} -> ${hit.symbol} ("${hit.display_name}")`);
+      resolved.push({ code: hit.symbol, label: want.label });
+    } else {
+      missing.push(want.code);
+    }
+  }
+
+  if (missing.length) console.error('No Deriv symbol found for:', missing.join(', '));
+  return resolved;
+}
+
+function subscribe(list) {
+  list.forEach((s) => {
+    if (!state[s.code]) {
+      state[s.code] = { candles: [], lastDirection: null, lastConfidence: 0, lastAlertAt: 0 };
+    }
+    labels[s.code] = s.label;
+    ws.send(JSON.stringify({
+      ticks_history: s.code,
+      style: 'candles',
+      granularity: GRANULARITY,
+      count: 150,
+      end: 'latest',
+      subscribe: 1,
+    }));
+  });
+}
 
 function connect() {
   ws = new WebSocket(`wss://ws.derivws.com/websockets/v3?app_id=${APP_ID}`);
@@ -141,16 +196,15 @@ function connect() {
   ws.on('open', () => {
     console.log('Connected to Deriv feed.');
     reconnectDelay = 3000;
-    SYMBOLS.forEach((s) => {
-      ws.send(JSON.stringify({
-        ticks_history: s.code,
-        style: 'candles',
-        granularity: GRANULARITY,
-        count: 150,
-        end: 'latest',
-        subscribe: 1,
-      }));
-    });
+    if (DERIV_TOKEN) {
+      ws.send(JSON.stringify({ authorize: DERIV_TOKEN }));
+    } else {
+      console.error(
+        'No DERIV_TOKEN set. Deriv returns an empty symbol list to unauthenticated ' +
+        'connections, so no signals can be produced. Set DERIV_TOKEN and redeploy.'
+      );
+      requestSymbols(); // still request, so the empty result is visible in logs
+    }
   });
 
   ws.on('message', (raw) => {
@@ -162,17 +216,50 @@ function connect() {
       return;
     }
     if (data.error) {
-      // Most likely cause: a symbol code in SYMBOLS is not valid on Deriv.
       console.error('Deriv error:', data.error.code, data.error.message,
         '| requested symbol:', data.echo_req?.ticks_history);
+      if (data.error.code === 'InvalidToken' || data.error.code === 'AuthorizationRequired') {
+        sendTelegram('⚠️ Deriv rejected the API token. Check DERIV_TOKEN and redeploy.');
+      }
       return;
     }
-    const sym = SYMBOLS.find((s) => s.code === data.echo_req?.ticks_history);
-    if (data.msg_type === 'candles' && sym) {
-      state[sym.code].candles = data.candles.map((c) => ({
+
+    if (data.msg_type === 'authorize') {
+      console.log('Authorized with Deriv as', data.authorize?.loginid || '(unknown account)');
+      requestSymbols();
+      return;
+    }
+
+    if (data.msg_type === 'active_symbols') {
+      const all = data.active_symbols || [];
+      const synth = all.filter((s) => s.market === 'synthetic_index');
+      console.log(`Deriv returned ${all.length} symbols (${synth.length} synthetic).`);
+      if (!all.length) {
+        console.error(
+          'Empty symbol list. Deriv requires an authorized token with read access ' +
+          'before it will return instruments.'
+        );
+        sendTelegram('⚠️ Deriv returned no instruments — DERIV_TOKEN is missing or lacks access.');
+        return;
+      }
+      synth.forEach((s) => console.log('  available:', s.symbol, '|', s.display_name));
+      activeSymbols = resolveWatchlist(synth);
+      if (!activeSymbols.length) {
+        console.error('None of the watchlist symbols exist on Deriv. Nothing to monitor.');
+        sendTelegram('⚠️ None of the watchlist symbols matched Deriv instruments.');
+        return;
+      }
+      console.log('Monitoring:', activeSymbols.map((s) => s.label).join(', '));
+      subscribe(activeSymbols);
+      return;
+    }
+
+    const reqSymbol = data.echo_req?.ticks_history;
+    if (data.msg_type === 'candles' && reqSymbol && state[reqSymbol]) {
+      state[reqSymbol].candles = data.candles.map((c) => ({
         time: c.epoch, open: +c.open, high: +c.high, low: +c.low, close: +c.close,
       }));
-      evaluateSignal(sym.code, sym.label);
+      evaluateSignal(reqSymbol, labels[reqSymbol] || reqSymbol);
     }
     if (data.msg_type === 'ohlc' && data.ohlc) {
       const symCode = data.ohlc.symbol;
@@ -186,8 +273,7 @@ function connect() {
       if (last && last.time === point.time) st.candles[st.candles.length - 1] = point;
       else st.candles.push(point);
       if (st.candles.length > 150) st.candles.shift();
-      const label = SYMBOLS.find((s) => s.code === symCode)?.label || symCode;
-      evaluateSignal(symCode, label);
+      evaluateSignal(symCode, labels[symCode] || symCode);
     }
   });
 
@@ -218,7 +304,9 @@ if (process.env.PORT) {
     res.end(JSON.stringify({
       status: 'ok',
       socket: ws?.readyState === 1 ? 'connected' : 'reconnecting',
-      symbolsReady: `${ready}/${SYMBOLS.length}`,
+      authorized: Boolean(DERIV_TOKEN),
+      monitoring: activeSymbols.map((s) => s.label),
+      symbolsReady: `${ready}/${activeSymbols.length || SYMBOLS.length}`,
       uptimeSeconds: Math.round(process.uptime()),
     }));
   }).listen(process.env.PORT, () => console.log(`Health endpoint on :${process.env.PORT}`));
