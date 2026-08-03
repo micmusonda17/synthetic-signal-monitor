@@ -65,7 +65,12 @@ const SPIKE_META = {
   C500: { nominal: 500, dir: -1 },
   C1000: { nominal: 1000, dir: -1 },
 };
-const SPIKE_BATCHES = Number(process.env.SPIKE_BATCHES || 12);
+// Deriv caps tick history at 1000 per request regardless of what you ask for,
+// and these instruments tick once a second, so one batch is about 17 minutes.
+// 60 batches is roughly 17 hours per symbol, which yields well over 100 spikes
+// on the 500-series and enough on the 1000-series to say something.
+const SPIKE_BATCHES = Number(process.env.SPIKE_BATCHES || 60);
+const SPIKE_BATCH_SIZE = Number(process.env.SPIKE_BATCH_SIZE || 1000);
 const SPIKE_MULT = Number(process.env.SPIKE_MULT || 8);
 
 const SYMBOLS = [
@@ -547,7 +552,7 @@ const spikeLab = { symbols: {}, pending: 0, reported: false };
 
 function requestSpikeHistory(code, end) {
   ws.send(JSON.stringify({
-    ticks_history: code, style: 'ticks', count: 5000, end: end || 'latest',
+    ticks_history: code, style: 'ticks', count: SPIKE_BATCH_SIZE, end: end || 'latest',
   }));
 }
 
@@ -572,12 +577,17 @@ function startSpikeLab(list) {
 function onSpikeHistory(code, prices, times) {
   const st = spikeLab.symbols[code];
   if (!st || st.done) return;
+  const newOldest = times[0];
   st.quotes = prices.map(Number).concat(st.quotes);
-  st.oldest = times[0];
   st.batches += 1;
 
-  if (st.batches < SPIKE_BATCHES && prices.length >= 4999) {
-    requestSpikeHistory(code, st.oldest - 1);
+  // Keep walking backwards while batches still arrive and the window is
+  // genuinely moving into older data. The timestamp guard matters: if Deriv runs
+  // out of history it returns the same window forever, which would loop.
+  const movedBack = st.oldest === null || newOldest < st.oldest;
+  st.oldest = newOldest;
+  if (st.batches < SPIKE_BATCHES && prices.length >= 100 && movedBack) {
+    setTimeout(() => requestSpikeHistory(code, newOldest - 1), 120);
     return;
   }
 
