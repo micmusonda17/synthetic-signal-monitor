@@ -10,10 +10,11 @@ import http from 'http';
 // trailing newline or space, which the API then rejects as invalid.
 const TELEGRAM_TOKEN = (process.env.TELEGRAM_TOKEN || '').trim();
 const TELEGRAM_CHAT_ID = (process.env.TELEGRAM_CHAT_ID || '').trim();
-// Deriv now returns an empty instrument list to unauthenticated connections,
-// so a read-scope API token is required for any market data.
-const DERIV_TOKEN = (process.env.DERIV_TOKEN || '').trim();
-const APP_ID = process.env.DERIV_APP_ID || '1089';
+// Deriv's public market-data socket. No token, no app_id, no authorize call.
+// The legacy wss://ws.derivws.com/websockets/v3 endpoint now returns an empty
+// instrument list unless authorized, which is why every symbol looked invalid.
+const WS_URL = process.env.DERIV_WS_URL
+  || 'wss://api.derivws.com/trading/v1/options/ws/public';
 const CONFIDENCE_THRESHOLD = Number(process.env.CONFIDENCE_THRESHOLD || 70);
 const GRANULARITY = Number(process.env.GRANULARITY_SECONDS || 900); // 900 = M15
 const ALERT_COOLDOWN_MS = Number(process.env.ALERT_COOLDOWN_MINUTES || 15) * 60 * 1000;
@@ -154,8 +155,10 @@ function requestSymbols() {
 
 // Match our watchlist against what Deriv really offers. Falls back to
 // display-name matching when a hardcoded code has been renamed.
+// Note: this endpoint uses underlying_symbol / underlying_symbol_name,
+// not the symbol / display_name of the legacy API.
 function resolveWatchlist(available) {
-  const byCode = new Map(available.map((s) => [s.symbol, s]));
+  const byCode = new Map(available.map((s) => [s.underlying_symbol, s]));
   const resolved = [];
   const missing = [];
 
@@ -167,12 +170,12 @@ function resolveWatchlist(available) {
     // e.g. "BOOM1000" -> look for a display name containing "boom" and "1000"
     const parts = want.code.toLowerCase().match(/[a-z]+|\d+/g) || [];
     const hit = available.find((s) => {
-      const name = (s.display_name || '').toLowerCase().replace(/\s+/g, '');
+      const name = (s.underlying_symbol_name || '').toLowerCase().replace(/\s+/g, '');
       return parts.every((p) => name.includes(p));
     });
     if (hit) {
-      console.log(`Remapped ${want.code} -> ${hit.symbol} ("${hit.display_name}")`);
-      resolved.push({ code: hit.symbol, label: want.label });
+      console.log(`Remapped ${want.code} -> ${hit.underlying_symbol} ("${hit.underlying_symbol_name}")`);
+      resolved.push({ code: hit.underlying_symbol, label: want.label });
     } else {
       missing.push(want.code);
     }
@@ -200,20 +203,12 @@ function subscribe(list) {
 }
 
 function connect() {
-  ws = new WebSocket(`wss://ws.derivws.com/websockets/v3?app_id=${APP_ID}`);
+  ws = new WebSocket(WS_URL);
 
   ws.on('open', () => {
-    console.log('Connected to Deriv feed.');
+    console.log('Connected to Deriv public feed.');
     reconnectDelay = 3000;
-    if (DERIV_TOKEN) {
-      ws.send(JSON.stringify({ authorize: DERIV_TOKEN }));
-    } else {
-      console.error(
-        'No DERIV_TOKEN set. Deriv returns an empty symbol list to unauthenticated ' +
-        'connections, so no signals can be produced. Set DERIV_TOKEN and redeploy.'
-      );
-      requestSymbols(); // still request, so the empty result is visible in logs
-    }
+    requestSymbols();
   });
 
   ws.on('message', (raw) => {
@@ -227,42 +222,26 @@ function connect() {
     if (data.error) {
       console.error('Deriv error:', data.error.code, data.error.message,
         '| requested symbol:', data.echo_req?.ticks_history);
-      if (data.error.code === 'InvalidToken' || data.error.code === 'AuthorizationRequired') {
-        console.error(
-          `Token length seen by the app: ${DERIV_TOKEN.length} chars. ` +
-          'If that is 0, the variable is not set. If it looks short or long, the paste was truncated.'
-        );
-        sendTelegram('Deriv rejected the API token. Check the DERIV_TOKEN value in Render and redeploy.');
-      }
       return;
     }
 
-    if (data.msg_type === 'authorize') {
-      console.log('Authorized with Deriv as', data.authorize?.loginid || '(unknown account)');
-      requestSymbols();
-      return;
-    }
-
-    if (data.msg_type === 'active_symbols') {
-      const all = data.active_symbols || [];
+    if (data.active_symbols) {
+      const all = data.active_symbols;
       const synth = all.filter((s) => s.market === 'synthetic_index');
       console.log(`Deriv returned ${all.length} symbols (${synth.length} synthetic).`);
       if (!all.length) {
-        console.error(
-          'Empty symbol list. Deriv requires an authorized token with read access ' +
-          'before it will return instruments.'
-        );
-        sendTelegram('⚠️ Deriv returned no instruments — DERIV_TOKEN is missing or lacks access.');
+        console.error('Empty symbol list from the public endpoint — unexpected.');
+        sendTelegram('Deriv returned no instruments. The feed endpoint may have changed.');
         return;
       }
-      synth.forEach((s) => console.log('  available:', s.symbol, '|', s.display_name));
       activeSymbols = resolveWatchlist(synth);
       if (!activeSymbols.length) {
         console.error('None of the watchlist symbols exist on Deriv. Nothing to monitor.');
-        sendTelegram('⚠️ None of the watchlist symbols matched Deriv instruments.');
+        sendTelegram('None of the watchlist symbols matched Deriv instruments.');
         return;
       }
       console.log('Monitoring:', activeSymbols.map((s) => s.label).join(', '));
+      sendTelegram('Monitor live — watching ' + activeSymbols.map((s) => s.label).join(', '));
       subscribe(activeSymbols);
       return;
     }
@@ -317,7 +296,6 @@ if (process.env.PORT) {
     res.end(JSON.stringify({
       status: 'ok',
       socket: ws?.readyState === 1 ? 'connected' : 'reconnecting',
-      authorized: Boolean(DERIV_TOKEN),
       monitoring: activeSymbols.map((s) => s.label),
       symbolsReady: `${ready}/${activeSymbols.length || SYMBOLS.length}`,
       uptimeSeconds: Math.round(process.uptime()),
@@ -325,5 +303,5 @@ if (process.env.PORT) {
   }).listen(process.env.PORT, () => console.log(`Health endpoint on :${process.env.PORT}`));
 }
 
-sendTelegram('✅ Synthetic Signal Desk monitor started — watching ' + SYMBOLS.map((s) => s.label).join(', '));
+sendTelegram('Synthetic Signal Desk starting up...');
 connect();
