@@ -52,6 +52,22 @@ const MIN_HOLD_SAMPLES = Number(process.env.MIN_HOLD_SAMPLES || 20);
 // is enough to calibrate against without slowing the boot noticeably.
 const HISTORY_BARS = Math.min(5000, Number(process.env.HISTORY_BARS || 2000));
 
+// ---- Boom/Crash spike analysis ----
+// Boom drifts down and spikes up; Crash drifts up and spikes down, on average
+// every 500 or 1000 ticks. That published average is the only piece of genuine
+// engineered structure in the whole product range, so it is the only place a
+// real edge could live. Whether it can be exploited depends entirely on the
+// shape of the gap distribution, which is what SPIKE_BATCHES of tick history
+// is collected to measure. 12 batches of 5000 ticks is roughly 16 hours.
+const SPIKE_META = {
+  B500: { nominal: 500, dir: +1 },
+  B1000: { nominal: 1000, dir: +1 },
+  C500: { nominal: 500, dir: -1 },
+  C1000: { nominal: 1000, dir: -1 },
+};
+const SPIKE_BATCHES = Number(process.env.SPIKE_BATCHES || 12);
+const SPIKE_MULT = Number(process.env.SPIKE_MULT || 8);
+
 const SYMBOLS = [
   { code: 'R_10', label: 'V10' },
   { code: 'R_25', label: 'V25' },
@@ -439,6 +455,178 @@ function reportBacktest() {
     `win ${active.winRate.toFixed(1)}%, exp ${active.expectancy.toFixed(3)}R | best ${best.key}`);
 }
 
+// ---- Boom/Crash spike lab ----
+// The "count ticks since the last spike" idea rests on one assumption: that
+// waiting makes a spike more likely. That is only true if the gaps between
+// spikes are NOT geometrically distributed. A geometric distribution is
+// memoryless - if Deriv rolls a 1-in-500 die on every tick, then after 900 quiet
+// ticks the chance of a spike on the next tick is still exactly 1 in 500, and
+// counting tells you precisely nothing. Every spike bot on the market assumes
+// otherwise without checking. This measures it.
+
+function median(xs) {
+  if (!xs.length) return 0;
+  const s = [...xs].sort((a, b) => a - b);
+  const m = s.length >> 1;
+  return s.length % 2 ? s[m] : (s[m - 1] + s[m]) / 2;
+}
+
+// A spike is a single-tick move many times larger than this instrument's normal
+// tick-to-tick movement. The threshold is derived from the data so it adapts to
+// each symbol instead of being hardcoded.
+function detectSpikes(quotes, direction, mult = SPIKE_MULT) {
+  const diffs = [];
+  for (let i = 1; i < quotes.length; i++) diffs.push(quotes[i] - quotes[i - 1]);
+  const typical = median(diffs.map(Math.abs).filter((d) => d > 0));
+  const threshold = typical * mult;
+  const indices = [];
+  for (let i = 0; i < diffs.length; i++) {
+    const d = diffs[i];
+    if (direction > 0 ? d > threshold : d < -threshold) indices.push(i + 1);
+  }
+  return { indices, typicalMove: typical, threshold };
+}
+
+function gapsBetween(indices) {
+  const gaps = [];
+  for (let i = 1; i < indices.length; i++) gaps.push(indices[i] - indices[i - 1]);
+  return gaps;
+}
+
+// Discrete hazard: of the gaps that survived to the start of a bucket, what
+// fraction ended inside it? Expressed per tick so buckets stay comparable.
+function hazardCurve(gaps, bucketSize = 100) {
+  if (!gaps.length) return [];
+  const top = Math.max(...gaps);
+  const out = [];
+  for (let lo = 0; lo < top; lo += bucketSize) {
+    const hi = lo + bucketSize;
+    const atRisk = gaps.filter((g) => g > lo).length;
+    const events = gaps.filter((g) => g > lo && g <= hi).length;
+    if (atRisk < 15) break; // too few survivors for the estimate to mean anything
+    out.push({ from: lo, to: hi, atRisk, events, perTick: events / atRisk / bucketSize });
+  }
+  return out;
+}
+
+function memorylessTest(gaps, bucketSize = 100) {
+  const curve = hazardCurve(gaps, bucketSize);
+  if (curve.length < 4) return { usable: false, reason: 'not enough spikes yet' };
+  const half = Math.floor(curve.length / 2);
+  const w = (bs) => {
+    const ev = bs.reduce((a, b) => a + b.events, 0);
+    const risk = bs.reduce((a, b) => a + b.atRisk * bucketSize, 0);
+    return risk ? ev / risk : 0;
+  };
+  const h1 = w(curve.slice(0, half));
+  const h2 = w(curve.slice(half));
+  // An early hazard of exactly zero means spikes never occur before a certain
+  // age - a guaranteed quiet period, which is the strongest edge available, not
+  // the absence of one. Dividing by it would report the opposite.
+  const ratio = h1 > 0 ? h2 / h1 : (h2 > 0 ? Infinity : 0);
+  // A memoryless process has standard deviation equal to its mean, so this sits
+  // at 1.0. Well below 1.0 means gaps cluster around a typical length.
+  const mean = gaps.reduce((a, b) => a + b, 0) / gaps.length;
+  const sd = Math.sqrt(gaps.reduce((a, b) => a + (b - mean) ** 2, 0) / gaps.length);
+  const cv = mean ? sd / mean : 0;
+  // Both statistics must agree before this claims an edge. The hazard ratio
+  // alone is unstable, because the late buckets are computed from whatever few
+  // long gaps survived, and on a genuinely memoryless series it produces false
+  // positives roughly one run in six. Claiming an edge that is not there is the
+  // expensive mistake here, so the coefficient of variation - which uses every
+  // gap rather than the tail - has to back it up.
+  const enough = gaps.length >= 30;
+  const verdict = !enough ? 'INSUFFICIENT'
+    : (cv < 0.75 && ratio > 1.2) ? 'EDGE'
+    : (cv < 0.9 && ratio > 1.1) ? 'WEAK' : 'NO EDGE';
+  return { usable: true, curve, earlyHazard: h1, lateHazard: h2, ratio, mean, sd, cv,
+    minGap: Math.min(...gaps), n: gaps.length, verdict };
+}
+
+const spikeLab = { symbols: {}, pending: 0, reported: false };
+
+function requestSpikeHistory(code, end) {
+  ws.send(JSON.stringify({
+    ticks_history: code, style: 'ticks', count: 5000, end: end || 'latest',
+  }));
+}
+
+function startSpikeLab(list) {
+  for (const s of list) {
+    const meta = SPIKE_META[s.label];
+    if (!meta) continue;
+    spikeLab.symbols[s.code] = {
+      label: s.label, meta, quotes: [], batches: 0, oldest: null, done: false,
+    };
+    spikeLab.pending += 1;
+    requestSpikeHistory(s.code);
+  }
+  if (spikeLab.pending) {
+    console.log(`[SPIKE] collecting ${SPIKE_BATCHES} x 5000 ticks for ` +
+      Object.values(spikeLab.symbols).map((s) => s.label).join(', '));
+  }
+}
+
+// Deriv caps a single request at 5000 ticks, so history is walked backwards one
+// batch at a time using the oldest timestamp seen so far.
+function onSpikeHistory(code, prices, times) {
+  const st = spikeLab.symbols[code];
+  if (!st || st.done) return;
+  st.quotes = prices.map(Number).concat(st.quotes);
+  st.oldest = times[0];
+  st.batches += 1;
+
+  if (st.batches < SPIKE_BATCHES && prices.length >= 4999) {
+    requestSpikeHistory(code, st.oldest - 1);
+    return;
+  }
+
+  st.done = true;
+  spikeLab.pending -= 1;
+  const det = detectSpikes(st.quotes, st.meta.dir);
+  const gaps = gapsBetween(det.indices);
+  st.result = memorylessTest(gaps);
+  st.spikes = det.indices.length;
+  st.ticks = st.quotes.length;
+  st.quotes = []; // analysis is done; do not hold tens of thousands of numbers
+  console.log(`[SPIKE] ${st.label}: ${st.ticks} ticks, ${st.spikes} spikes, ` +
+    (st.result.usable
+      ? `meanGap ${st.result.mean.toFixed(0)} (nominal ${st.meta.nominal}), ` +
+        `cv ${st.result.cv.toFixed(2)}, hazard ratio ${st.result.ratio.toFixed(2)} -> ${st.result.verdict}`
+      : st.result.reason));
+  reportSpikeLab();
+}
+
+function reportSpikeLab() {
+  if (spikeLab.reported || spikeLab.pending > 0) return;
+  const all = Object.values(spikeLab.symbols).filter((s) => s.done);
+  if (!all.length) return;
+  spikeLab.reported = true;
+
+  const lines = all.map((s) => {
+    if (!s.result.usable) return `${s.label}: ${s.result.reason}`;
+    const r = s.result;
+    const ratio = r.ratio === Infinity ? 'inf' : r.ratio.toFixed(2);
+    return `${s.label}: gap ${r.mean.toFixed(0)} vs ${s.meta.nominal} nominal, ` +
+      `spread ${r.cv.toFixed(2)}, waiting-pays ${ratio} - ${r.verdict}`;
+  });
+
+  const anyEdge = all.some((s) => s.result.usable && s.result.verdict !== 'NO EDGE');
+  const conclusion = anyEdge
+    ? 'At least one symbol shows a rising spike probability. Counting ticks is worth building a strategy around - ask for the entry rules next.'
+    : 'Every symbol looks memoryless: the chance of a spike on the next tick does not rise as you wait. Counting ticks cannot produce an edge here, and any bot claiming otherwise is selling you a coin flip.';
+
+  sendTelegram(
+    `Spike analysis - Boom/Crash, ${all[0].ticks} ticks each\n\n` +
+    `${lines.join('\n')}\n\n` +
+    `"spread" is how tightly gaps cluster. 1.00 means purely random timing; ` +
+    `below 0.75 means spikes arrive on a schedule you can anticipate.\n` +
+    `"waiting-pays" is how much more likely a spike becomes once you have waited. ` +
+    `1.00 means waiting does not help at all.\n\n${conclusion}`
+  );
+  console.log('[SPIKE] verdicts:', all.map((s) => `${s.label}=${s.result.verdict || 'n/a'}`).join(' '));
+}
+
 // ---- Per-symbol state ----
 // Keyed by the symbol code Deriv actually accepts, which is resolved at runtime.
 const state = {};
@@ -680,6 +868,14 @@ function connect() {
         `SL ${SL_ATR_MULT}x ATR / TP ${TP_ATR_MULT}x ATR (${rrLabel}).`
       );
       subscribe(activeSymbols);
+      startSpikeLab(activeSymbols);
+      return;
+    }
+
+    // Tick history comes back as msg_type 'history', separate from the candle
+    // stream, and is used only for the Boom/Crash spike analysis.
+    if (data.msg_type === 'history' && data.history && data.echo_req?.ticks_history) {
+      onSpikeHistory(data.echo_req.ticks_history, data.history.prices, data.history.times);
       return;
     }
 
@@ -763,6 +959,16 @@ if (process.env.PORT) {
         tp: backtest.tp, sl: backtest.sl, timeout: backtest.timeout,
       },
       liveOutcomes: { tp: outcomes.tp, sl: outcomes.sl, timeout: outcomes.timeout },
+      spikeAnalysis: Object.fromEntries(
+        Object.values(spikeLab.symbols).filter((s) => s.done).map((s) => [s.label, {
+          ticks: s.ticks, spikes: s.spikes, nominalGap: s.meta.nominal,
+          measuredGap: s.result.usable ? Math.round(s.result.mean) : null,
+          gapSpread: s.result.usable ? +s.result.cv.toFixed(2) : null,
+          waitingPays: s.result.usable
+            ? (s.result.ratio === Infinity ? 'inf' : +s.result.ratio.toFixed(2)) : null,
+          verdict: s.result.usable ? s.result.verdict : s.result.reason,
+        }])
+      ),
       openTrades: Object.fromEntries(
         Object.entries(state)
           .filter(([, s]) => s.open)
