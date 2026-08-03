@@ -6,11 +6,13 @@ import https from 'https';
 import http from 'http';
 
 // ---- Config (set these as environment variables in your host) ----
-const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN;
-const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
+// Trim everything: pasting into a dashboard field very easily picks up a
+// trailing newline or space, which the API then rejects as invalid.
+const TELEGRAM_TOKEN = (process.env.TELEGRAM_TOKEN || '').trim();
+const TELEGRAM_CHAT_ID = (process.env.TELEGRAM_CHAT_ID || '').trim();
 // Deriv now returns an empty instrument list to unauthenticated connections,
 // so a read-scope API token is required for any market data.
-const DERIV_TOKEN = process.env.DERIV_TOKEN;
+const DERIV_TOKEN = (process.env.DERIV_TOKEN || '').trim();
 const APP_ID = process.env.DERIV_APP_ID || '1089';
 const CONFIDENCE_THRESHOLD = Number(process.env.CONFIDENCE_THRESHOLD || 70);
 const GRANULARITY = Number(process.env.GRANULARITY_SECONDS || 900); // 900 = M15
@@ -35,8 +37,14 @@ if (!TELEGRAM_TOKEN || !TELEGRAM_CHAT_ID) {
 }
 
 // ---- Telegram sender ----
-function sendTelegram(text) {
-  const payload = JSON.stringify({ chat_id: TELEGRAM_CHAT_ID, text, parse_mode: 'Markdown' });
+// markdown defaults to false: plain text can never fail to parse. Only the
+// signal alerts opt in, because they are the only messages using *bold*.
+// (Status messages mention things like DERIV_TOKEN, and a lone underscore
+// makes Telegram reject the whole message with a 400.)
+function sendTelegram(text, { markdown = false } = {}) {
+  const body = { chat_id: TELEGRAM_CHAT_ID, text };
+  if (markdown) body.parse_mode = 'Markdown';
+  const payload = JSON.stringify(body);
   const req = https.request(
     {
       hostname: 'api.telegram.org',
@@ -123,7 +131,8 @@ function evaluateSignal(code, label) {
 
   if ((directionFlip || (crossedIn && st.lastDirection === direction)) && cooledDown) {
     sendTelegram(
-      `*${direction}* signal — ${label}\nConfidence: ${confidence}%\nPrice: ${price.toFixed(2)}\nRSI(14): ${rsiVal.toFixed(1)}\nATR(14): ${atrVal ? atrVal.toFixed(2) : '—'}`
+      `*${direction}* signal — ${label}\nConfidence: ${confidence}%\nPrice: ${price.toFixed(2)}\nRSI(14): ${rsiVal.toFixed(1)}\nATR(14): ${atrVal ? atrVal.toFixed(2) : '—'}`,
+      { markdown: true }
     );
     console.log(`[ALERT] ${label} ${direction} @ ${confidence}%`);
     st.lastAlertAt = Date.now();
@@ -219,7 +228,11 @@ function connect() {
       console.error('Deriv error:', data.error.code, data.error.message,
         '| requested symbol:', data.echo_req?.ticks_history);
       if (data.error.code === 'InvalidToken' || data.error.code === 'AuthorizationRequired') {
-        sendTelegram('⚠️ Deriv rejected the API token. Check DERIV_TOKEN and redeploy.');
+        console.error(
+          `Token length seen by the app: ${DERIV_TOKEN.length} chars. ` +
+          'If that is 0, the variable is not set. If it looks short or long, the paste was truncated.'
+        );
+        sendTelegram('Deriv rejected the API token. Check the DERIV_TOKEN value in Render and redeploy.');
       }
       return;
     }
