@@ -16,7 +16,9 @@ const TELEGRAM_CHAT_ID = (process.env.TELEGRAM_CHAT_ID || '').trim();
 // instrument list unless authorized, which is why every symbol looked invalid.
 const WS_URL = process.env.DERIV_WS_URL
   || 'wss://api.derivws.com/trading/v1/options/ws/public';
-const CONFIDENCE_THRESHOLD = Number(process.env.CONFIDENCE_THRESHOLD || 70);
+// 74 was chosen by simulation: it yields roughly 6 signals a day across the
+// full 10-symbol watchlist. Drop to 72 for ~8/day, raise to 78 for ~3/day.
+const CONFIDENCE_THRESHOLD = Number(process.env.CONFIDENCE_THRESHOLD || 74);
 const GRANULARITY = Number(process.env.GRANULARITY_SECONDS || 900); // 900 = M15
 const ALERT_COOLDOWN_MS = Number(process.env.ALERT_COOLDOWN_MINUTES || 15) * 60 * 1000;
 
@@ -33,6 +35,22 @@ const TP_ATR_MULT = Number(process.env.TP_ATR_MULT || 3.0);
 const TREND_DIV = Number(process.env.TREND_DIV || 3.0);
 const SLOPE_DIV = Number(process.env.SLOPE_DIV || 1.4);
 const ENTRY_DIV = Number(process.env.ENTRY_DIV || 2.5);
+
+// A trade that has gone nowhere is not a trade, it is exposure. After this many
+// candles the monitor stops waiting and tells you to close it. 24 M15 candles
+// is 6 hours, which in simulation covers about 90% of trades that resolve.
+const TIME_STOP_BARS = Number(process.env.TIME_STOP_BARS || 24);
+
+// Hold-time expectations, in candles. These start as simulation-derived
+// estimates and are replaced by this bot's own measured results as soon as it
+// has enough closed trades to say something meaningful.
+const HOLD_FALLBACK = { p25: 3, median: 6, p75: 10 };
+const MIN_HOLD_SAMPLES = Number(process.env.MIN_HOLD_SAMPLES || 20);
+
+// How much real history to pull per symbol on startup. Deriv caps ticks_history
+// at 5000 candles; 2000 M15 candles is about three weeks per instrument, which
+// is enough to calibrate against without slowing the boot noticeably.
+const HISTORY_BARS = Math.min(5000, Number(process.env.HISTORY_BARS || 2000));
 
 const SYMBOLS = [
   { code: 'R_10', label: 'V10' },
@@ -199,6 +217,228 @@ const rrLabel = (() => {
   return `1:${Number.isInteger(rr) ? rr : rr.toFixed(1)}`;
 })();
 
+// ---- Hold-time guidance ----
+// Candle counts are meaningless to read at a glance, so everything the user
+// sees is expressed in wall-clock time derived from the configured granularity.
+function humanDuration(bars) {
+  const mins = Math.round((bars * GRANULARITY) / 60);
+  if (mins < 60) return `${mins}m`;
+  const h = mins / 60;
+  return h < 10 ? `${h.toFixed(1).replace(/\.0$/, '')}h` : `${Math.round(h)}h`;
+}
+
+// Every closed trade feeds back into the hold estimate, so the guidance stops
+// being a simulation artefact and starts describing this specific bot on these
+// specific instruments. Timed-out trades are excluded: they never resolved, so
+// including them would bias the "how long until TP or SL" answer upward.
+const outcomes = { tp: 0, sl: 0, timeout: 0, resolvedBars: [] };
+
+function percentiles(arr) {
+  const s = [...arr].sort((a, b) => a - b);
+  const q = (p) => s[Math.min(s.length - 1, Math.floor(s.length * p))];
+  return { p25: q(0.25), median: q(0.5), p75: q(0.75) };
+}
+
+// Preference order: this bot's own closed trades, then the startup backtest on
+// real Deriv history, then the simulated fallback. Each step is closer to what
+// the user will actually experience than the one after it.
+function holdGuidance() {
+  if (outcomes.resolvedBars.length >= MIN_HOLD_SAMPLES) {
+    return { ...percentiles(outcomes.resolvedBars), source: 'live', n: outcomes.resolvedBars.length };
+  }
+  if (backtest.bars.length >= MIN_HOLD_SAMPLES) {
+    return { ...percentiles(backtest.bars), source: 'backtest', n: backtest.bars.length };
+  }
+  return { ...HOLD_FALLBACK, source: 'simulated', n: 0 };
+}
+
+// ---- Startup backtest on real Deriv history ----
+// A stop that keeps getting hit is usually too tight for the instrument's noise
+// rather than a sign the direction was wrong, so the backtest does not just
+// score the configured levels — it replays several stop/target pairs over the
+// same signals and reports which one actually held up.
+const RISK_VARIANTS = [
+  { sl: 1.0, tp: 2.0 },
+  { sl: 1.5, tp: 3.0 },
+  { sl: 2.0, tp: 3.0 },
+  { sl: 2.0, tp: 4.0 },
+  { sl: 2.5, tp: 5.0 },
+  { sl: 3.0, tp: 3.0 },
+];
+const variantKey = (v) => `${v.sl}/${v.tp}`;
+const ACTIVE_VARIANT = variantKey({ sl: SL_ATR_MULT, tp: TP_ATR_MULT });
+
+function blankVariant() {
+  return { signals: 0, tp: 0, sl: 0, timeout: 0, sumR: 0, bars: [] };
+}
+
+const backtest = {
+  done: 0, days: 0, reported: false,
+  variants: Object.fromEntries(RISK_VARIANTS.map((v) => [variantKey(v), blankVariant()])),
+  get active() { return this.variants[ACTIVE_VARIANT] || blankVariant(); },
+  get signals() { return this.active.signals; },
+  get tp() { return this.active.tp; },
+  get sl() { return this.active.sl; },
+  get timeout() { return this.active.timeout; },
+  get bars() { return this.active.bars; },
+};
+
+// The configured levels may not be one of the presets, so make sure they are
+// always measured — otherwise the summary would report on settings the user
+// is not actually running.
+if (!backtest.variants[ACTIVE_VARIANT]) {
+  RISK_VARIANTS.push({ sl: SL_ATR_MULT, tp: TP_ATR_MULT });
+  backtest.variants[ACTIVE_VARIANT] = blankVariant();
+}
+
+// Replays exactly the live gating rules over historical candles: same score,
+// same threshold cross / flip trigger, same cooldown, same one-position rule,
+// same time stop. If this disagrees with live behaviour later, the rules here
+// have drifted from evaluateSignal and that is a bug, not a market change.
+function backtestSymbol(code, label, candles) {
+  if (candles.length < 200) return;
+  const cooldownBars = Math.max(1, Math.round(ALERT_COOLDOWN_MS / (GRANULARITY * 1000)));
+
+  // Scoring is by far the expensive part and does not depend on stop placement,
+  // so it runs once per bar and every risk variant reuses the result.
+  const scores = new Array(candles.length).fill(null);
+  for (let i = 60; i < candles.length; i++) {
+    const win = candles.slice(Math.max(0, i - 150), i);
+    if (win.length < 55) continue;
+    const closes = win.map((c) => c.close);
+    const atrVal = atr(win, 14);
+    const rsiVal = rsi(closes, 14);
+    const price = closes.at(-1);
+    if (!atrVal || atrVal <= 0 || rsiVal === null || !Number.isFinite(price)) continue;
+    const { confidence, direction } = scoreSignal({
+      closes, ema20Series: ema(closes, 20), ema50Series: ema(closes, 50),
+      rsiVal, atrVal, price,
+    });
+    scores[i] = { confidence, direction, atrVal, price };
+  }
+
+  for (const v of RISK_VARIANTS) {
+    const acc = backtest.variants[variantKey(v)];
+    let lastConf = 0, lastDir = null, lastAlertBar = -1e9, open = null;
+
+    for (let i = 60; i < candles.length; i++) {
+      const bar = candles[i];
+
+      if (open) {
+        const held = i - open.i;
+        const long = open.dir === 'BUY';
+        const hitSl = long ? bar.low <= open.sl : bar.high >= open.sl;
+        const hitTp = long ? bar.high >= open.tp : bar.low <= open.tp;
+        let out = null;
+        // Stop checked first: if one candle spans both levels there is no way to
+        // know which traded first, and assuming the loss is the honest default.
+        if (hitSl) out = 'SL';
+        else if (hitTp) out = 'TP';
+        else if (held >= TIME_STOP_BARS) out = 'TIME';
+        if (out) {
+          if (out === 'TP') { acc.tp++; acc.sumR += v.tp / v.sl; }
+          else if (out === 'SL') { acc.sl++; acc.sumR -= 1; }
+          else {
+            acc.timeout++;
+            // A timed-out trade is closed at market, so credit its real result
+            // rather than pretending it was flat.
+            const move = long ? bar.close - open.entry : open.entry - bar.close;
+            acc.sumR += move / open.risk;
+          }
+          if (out !== 'TIME') acc.bars.push(held);
+          open = null;
+          lastAlertBar = i;
+        }
+        continue;
+      }
+
+      const sc = scores[i];
+      if (!sc) continue;
+      const strong = sc.confidence >= CONFIDENCE_THRESHOLD;
+      const crossedUp = strong && lastConf < CONFIDENCE_THRESHOLD;
+      const flipped = strong && lastDir !== null && lastDir !== sc.direction;
+      if ((crossedUp || flipped) && (i - lastAlertBar) > cooldownBars) {
+        const long = sc.direction === 'BUY';
+        const risk = v.sl * sc.atrVal;
+        const reward = v.tp * sc.atrVal;
+        open = {
+          i, dir: sc.direction, entry: sc.price, risk,
+          sl: long ? sc.price - risk : sc.price + risk,
+          tp: long ? sc.price + reward : sc.price - reward,
+        };
+        acc.signals++;
+      }
+      lastConf = sc.confidence;
+      lastDir = sc.direction;
+    }
+  }
+
+  const spanDays = (candles.at(-1).time - candles[0].time) / 86400;
+  backtest.done += 1;
+  backtest.days = Math.max(backtest.days, spanDays);
+  const a = backtest.active;
+  console.log(
+    `[BACKTEST] ${label}: ${spanDays.toFixed(1)}d, active ${ACTIVE_VARIANT} -> ` +
+    `${a.signals} signals TP=${a.tp} SL=${a.sl} timeout=${a.timeout}`
+  );
+}
+
+// Reported once, after every symbol has been replayed, so the user gets a single
+// honest summary of what these settings would have produced recently.
+function variantSummary(key) {
+  const a = backtest.variants[key];
+  const closed = a.tp + a.sl + a.timeout;
+  if (!closed) return null;
+  return {
+    key, closed,
+    winRate: (100 * a.tp) / closed,
+    expectancy: a.sumR / closed,
+    perDay: a.signals / Math.max(backtest.days, 1),
+    hold: percentiles(a.bars.length ? a.bars : [HOLD_FALLBACK.median]),
+  };
+}
+
+function reportBacktest() {
+  if (backtest.reported || !activeSymbols.length || backtest.done < activeSymbols.length) return;
+  backtest.reported = true;
+
+  const active = variantSummary(ACTIVE_VARIANT);
+  if (!active) return;
+  const all = Object.keys(backtest.variants).map(variantSummary).filter(Boolean);
+  const best = all.reduce((a, b) => (b.expectancy > a.expectancy ? b : a));
+
+  const rows = all
+    .sort((a, b) => b.expectancy - a.expectancy)
+    .map((s) => {
+      const mark = s.key === ACTIVE_VARIANT ? ' (current)' : '';
+      const e = `${s.expectancy >= 0 ? '+' : ''}${s.expectancy.toFixed(2)}R`;
+      return `SL ${s.key.split('/')[0]}x TP ${s.key.split('/')[1]}x — ` +
+        `win ${s.winRate.toFixed(0)}%, ${e}/trade${mark}`;
+    })
+    .join('\n');
+
+  const advice = best.key === ACTIVE_VARIANT
+    ? 'Your current levels came out best of those tested.'
+    : `Better on this data: SL ${best.key.split('/')[0]}x TP ${best.key.split('/')[1]}x ` +
+      `(${best.expectancy >= 0 ? '+' : ''}${best.expectancy.toFixed(2)}R vs ` +
+      `${active.expectancy >= 0 ? '+' : ''}${active.expectancy.toFixed(2)}R). ` +
+      `Set SL ATR MULT=${best.key.split('/')[0]} and TP ATR MULT=${best.key.split('/')[1]} in Render to switch.`;
+
+  sendTelegram(
+    `Backtest — ${backtest.days.toFixed(0)} days of real Deriv candles, ` +
+    `${activeSymbols.length} symbols, threshold ${CONFIDENCE_THRESHOLD}%\n\n` +
+    `Current settings (SL ${SL_ATR_MULT}x / TP ${TP_ATR_MULT}x):\n` +
+    `Signals ${active.perDay.toFixed(1)}/day · win ${active.winRate.toFixed(0)}% · ` +
+    `${active.expectancy >= 0 ? '+' : ''}${active.expectancy.toFixed(2)}R per trade\n` +
+    `Typical hold ${humanDuration(active.hold.median)} ` +
+    `(${humanDuration(active.hold.p25)} to ${humanDuration(active.hold.p75)})\n\n` +
+    `Stop and target comparison:\n${rows}\n\n${advice}`
+  );
+
+  console.log(`[BACKTEST] active ${ACTIVE_VARIANT}: ${active.perDay.toFixed(2)}/day, ` +
+    `win ${active.winRate.toFixed(1)}%, exp ${active.expectancy.toFixed(3)}R | best ${best.key}`);
+}
+
 // ---- Per-symbol state ----
 // Keyed by the symbol code Deriv actually accepts, which is resolved at runtime.
 const state = {};
@@ -227,11 +467,16 @@ function evaluateSignal(code, label) {
   const crossedUp = strong && st.lastConfidence < CONFIDENCE_THRESHOLD;
   const flipped = strong && st.lastDirection !== null && st.lastDirection !== direction;
   const cooledDown = Date.now() - st.lastAlertAt > ALERT_COOLDOWN_MS;
+  // One position per symbol. Stacking a second call on V75 while the first is
+  // still open doubles the risk on a single instrument and is the main reason
+  // the old build felt noisy — the same trend kept re-announcing itself.
+  const free = !st.open;
 
-  if ((crossedUp || flipped) && cooledDown) {
+  if (free && (crossedUp || flipped) && cooledDown) {
     const { entry, sl, tp, risk, reward } = levelsFor(direction, price, atrVal);
     const d = st.decimals ?? 2;
     const arrow = direction === 'BUY' ? '\u{1F7E2}' : '\u{1F534}';
+    const g = holdGuidance();
 
     sendTelegram(
       `${arrow} *${direction} ${label} NOW*\n\n` +
@@ -239,10 +484,17 @@ function evaluateSignal(code, label) {
       `SL     ${sl.toFixed(d)}  (${direction === 'BUY' ? '-' : '+'}${risk.toFixed(d)})\n` +
       `TP     ${tp.toFixed(d)}  (${direction === 'BUY' ? '+' : '-'}${reward.toFixed(d)})\n` +
       `R:R    ${rrLabel}\n\n` +
+      `Hold   about ${humanDuration(g.median)}, usually ${humanDuration(g.p25)} to ${humanDuration(g.p75)}\n` +
+      `Close  after ${humanDuration(TIME_STOP_BARS)} if neither level is hit\n\n` +
       `*Confidence ${confidence}%*\n` +
       `RSI(14) ${rsiVal.toFixed(1)} · ATR(14) ${atrVal.toFixed(d)}`,
       { markdown: true }
     );
+
+    st.open = {
+      direction, entry, sl, tp, risk, confidence,
+      bars: 0, openedAt: Date.now(), openBarTime: st.candles.at(-1).time,
+    };
     console.log(
       `[ALERT] ${label} ${direction} @ ${confidence}% ` +
       `entry=${entry.toFixed(d)} sl=${sl.toFixed(d)} tp=${tp.toFixed(d)} ` +
@@ -254,6 +506,71 @@ function evaluateSignal(code, label) {
 
   st.lastDirection = direction;
   st.lastConfidence = confidence;
+}
+
+// ---- Open trade tracking ----
+// Called on every price update. Watches the live candle's high and low rather
+// than its close, because a stop is hit the moment price trades through it, not
+// only when a candle happens to close beyond it.
+function checkOpenTrade(code, label) {
+  const st = state[code];
+  const o = st?.open;
+  if (!o) return;
+  const bar = st.candles.at(-1);
+  if (!bar) return;
+
+  // Count elapsed candles by bar timestamp, so a reconnect or a burst of
+  // updates inside one candle cannot inflate the hold time.
+  if (bar.time !== o.lastBarTime) {
+    o.lastBarTime = bar.time;
+    if (bar.time !== o.openBarTime) o.bars += 1;
+  }
+
+  const long = o.direction === 'BUY';
+  let outcome = null;
+  let exit = null;
+
+  // If a single candle straddles both levels there is no way to know which came
+  // first, so assume the stop — the conservative reading, and the one that
+  // avoids reporting a win that may not have happened.
+  const hitSl = long ? bar.low <= o.sl : bar.high >= o.sl;
+  const hitTp = long ? bar.high >= o.tp : bar.low <= o.tp;
+  if (hitSl) { outcome = 'SL'; exit = o.sl; }
+  else if (hitTp) { outcome = 'TP'; exit = o.tp; }
+  else if (o.bars >= TIME_STOP_BARS) { outcome = 'TIME'; exit = bar.close; }
+  if (!outcome) return;
+
+  const d = st.decimals ?? 2;
+  const rMultiple = ((long ? exit - o.entry : o.entry - exit) / o.risk);
+  const rTxt = `${rMultiple >= 0 ? '+' : ''}${rMultiple.toFixed(1)}R`;
+  const held = `${o.bars} candle${o.bars === 1 ? '' : 's'} (${humanDuration(o.bars)})`;
+
+  if (outcome === 'TP') outcomes.tp += 1;
+  else if (outcome === 'SL') outcomes.sl += 1;
+  else outcomes.timeout += 1;
+  // Timed-out trades never reached a level, so they would skew the hold stats.
+  if (outcome !== 'TIME') outcomes.resolvedBars.push(o.bars);
+
+  const header = outcome === 'TP' ? '✅ *TARGET HIT*'
+    : outcome === 'SL' ? '❌ *STOP HIT*'
+    : '⏰ *TIME STOP*';
+  const closer = outcome === 'TIME'
+    ? `\nNeither level hit in ${humanDuration(TIME_STOP_BARS)} — consider closing.`
+    : '';
+
+  sendTelegram(
+    `${header} — ${label} ${o.direction}\n\n` +
+    `Entry  ${o.entry.toFixed(d)}\n` +
+    `Exit   ${exit.toFixed(d)}\n` +
+    `Result ${rTxt} · held ${held}${closer}`,
+    { markdown: true }
+  );
+  console.log(`[CLOSE] ${label} ${o.direction} ${outcome} ${rTxt} after ${o.bars} bars`);
+
+  st.open = null;
+  // Start the cooldown from the close, not the entry, so the next alert on this
+  // symbol is genuinely a fresh setup rather than the tail of the last one.
+  st.lastAlertAt = Date.now();
 }
 
 // ---- Deriv WebSocket connection with auto-reconnect ----
@@ -303,7 +620,7 @@ function subscribe(list) {
     if (!state[s.code]) {
       state[s.code] = {
         candles: [], lastDirection: null, lastConfidence: 0,
-        lastAlertAt: 0, lastSignal: null, decimals: null,
+        lastAlertAt: 0, lastSignal: null, decimals: null, open: null,
       };
     }
     labels[s.code] = s.label;
@@ -311,7 +628,7 @@ function subscribe(list) {
       ticks_history: s.code,
       style: 'candles',
       granularity: GRANULARITY,
-      count: 150,
+      count: HISTORY_BARS,
       end: 'latest',
       subscribe: 1,
     }));
@@ -375,9 +692,16 @@ function connect() {
           decimalsOf(data.candles.at(-1).open)
         );
       }
-      st.candles = data.candles.map((c) => ({
+      const full = data.candles.map((c) => ({
         time: c.epoch, open: +c.open, high: +c.high, low: +c.low, close: +c.close,
       }));
+      // Deriv hands us thousands of real candles on the first response. Replaying
+      // the strategy over them costs nothing and produces calibration figures
+      // from this instrument's actual behaviour, which beats any assumption
+      // about what a synthetic index does.
+      backtestSymbol(reqSymbol, labels[reqSymbol] || reqSymbol, full);
+      reportBacktest();
+      st.candles = full.slice(-150);
       evaluateSignal(reqSymbol, labels[reqSymbol] || reqSymbol);
     }
     if (data.msg_type === 'ohlc' && data.ohlc) {
@@ -393,6 +717,9 @@ function connect() {
       if (last && last.time === point.time) st.candles[st.candles.length - 1] = point;
       else st.candles.push(point);
       if (st.candles.length > 150) st.candles.shift();
+      // Manage the existing position before looking for a new one, so a trade
+      // that just closed frees the symbol on this same update.
+      checkOpenTrade(symCode, labels[symCode] || symCode);
       evaluateSignal(symCode, labels[symCode] || symCode);
     }
   });
@@ -427,7 +754,23 @@ if (process.env.PORT) {
       monitoring: activeSymbols.map((s) => s.label),
       symbolsReady: `${ready}/${activeSymbols.length || SYMBOLS.length}`,
       threshold: CONFIDENCE_THRESHOLD,
-      risk: { slAtrMult: SL_ATR_MULT, tpAtrMult: TP_ATR_MULT, rr: rrLabel },
+      risk: { slAtrMult: SL_ATR_MULT, tpAtrMult: TP_ATR_MULT, rr: rrLabel, timeStopBars: TIME_STOP_BARS },
+      hold: holdGuidance(),
+      backtest: {
+        days: Math.round(backtest.days),
+        signals: backtest.signals,
+        perDay: +(backtest.signals / Math.max(backtest.days, 1)).toFixed(2),
+        tp: backtest.tp, sl: backtest.sl, timeout: backtest.timeout,
+      },
+      liveOutcomes: { tp: outcomes.tp, sl: outcomes.sl, timeout: outcomes.timeout },
+      openTrades: Object.fromEntries(
+        Object.entries(state)
+          .filter(([, s]) => s.open)
+          .map(([code, s]) => [labels[code] || code, {
+            direction: s.open.direction, entry: s.open.entry,
+            sl: s.open.sl, tp: s.open.tp, barsHeld: s.open.bars,
+          }])
+      ),
       lastSignals: Object.fromEntries(
         Object.entries(state)
           .filter(([, s]) => s.lastSignal)
