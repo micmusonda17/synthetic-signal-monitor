@@ -453,8 +453,24 @@ const MGMT_VARIANTS = [
   { key: 'break-even at 0.5R', cfg: { beAtR: 0.5, trailAfterR: 0, trailDistR: 0 } },
 ];
 
+// Every stop/target paired with every stop rule, so the out-of-sample check
+// covers the same choices the in-sample tables offer.
+const SPLIT_COMBOS = (() => {
+  const out = [];
+  for (const v of RISK_VARIANTS) {
+    for (const m of MGMT_VARIANTS) {
+      out.push({ key: `SL${v.sl} TP${v.tp} ${m.key}`, sl: v.sl, tp: v.tp, cfg: m.cfg });
+    }
+  }
+  return out;
+})();
+
 const backtest = {
   done: 0, days: 0, reported: false,
+  split: {
+    inSample: Object.fromEntries(SPLIT_COMBOS.map((c) => [c.key, blankVariant()])),
+    outSample: Object.fromEntries(SPLIT_COMBOS.map((c) => [c.key, blankVariant()])),
+  },
   mgmt: Object.fromEntries(MGMT_VARIANTS.map((m) => [m.key, blankVariant()])),
   variants: Object.fromEntries(RISK_VARIANTS.map((v) => [variantKey(v), blankVariant()])),
   get active() { return this.variants[ACTIVE_VARIANT] || blankVariant(); },
@@ -502,10 +518,10 @@ function backtestSymbol(code, label, candles) {
   // One replay engine, driven by a risk setting and a management mode, so the
   // stop/target sweep and the break-even sweep cannot disagree with each other
   // or with the live monitor.
-  const replay = (slMult, tpMult, mgmt, acc) => {
+  const replay = (slMult, tpMult, mgmt, acc, from = 60, to = candles.length) => {
     let lastConf = 0, lastDir = null, lastAlertBar = -1e9, open = null;
 
-    for (let i = 60; i < candles.length; i++) {
+    for (let i = from; i < to; i++) {
       const bar = candles[i];
 
       if (open) {
@@ -566,6 +582,17 @@ function backtestSymbol(code, label, candles) {
   // Management sweep, held at the configured stop/target so the only thing
   // changing is whether the stop is allowed to move.
   for (const m of MGMT_VARIANTS) replay(SL_ATR_MULT, TP_ATR_MULT, m.cfg, backtest.mgmt[m.key]);
+
+  // Out-of-sample check. Picking the best of a dozen settings on one stretch of
+  // history will always produce a flattering number - some of that result is the
+  // setting fitting the noise. So every combination is also run separately on
+  // the first and second halves. The winner is chosen on the first half only,
+  // and judged on the second, which it never saw.
+  const mid = Math.floor((60 + candles.length) / 2);
+  for (const combo of SPLIT_COMBOS) {
+    replay(combo.sl, combo.tp, combo.cfg, backtest.split.inSample[combo.key], 60, mid);
+    replay(combo.sl, combo.tp, combo.cfg, backtest.split.outSample[combo.key], mid, candles.length);
+  }
 
   const spanDays = (candles.at(-1).time - candles[0].time) / 86400;
   backtest.done += 1;
@@ -633,6 +660,31 @@ function reportBacktest() {
       `${active.expectancy >= 0 ? '+' : ''}${active.expectancy.toFixed(2)}R). ` +
       `Set SL ATR MULT=${best.key.split('/')[0]} and TP ATR MULT=${best.key.split('/')[1]} in Render to switch.`;
 
+  // The honest test: choose on the first half, judge on the second.
+  const expOf = (acc) => {
+    const n = acc.tp + acc.sl + acc.timeout;
+    return n ? { n, exp: acc.sumR / n, win: (100 * acc.tp) / n } : null;
+  };
+  const inS = SPLIT_COMBOS.map((c) => ({ key: c.key, s: expOf(backtest.split.inSample[c.key]) }))
+    .filter((x) => x.s && x.s.n >= 15);
+  let oosBlock = '';
+  if (inS.length) {
+    const pick = inS.reduce((a, b) => (b.s.exp > a.s.exp ? b : a));
+    const after = expOf(backtest.split.outSample[pick.key]);
+    const heldUp = after && after.exp > 0;
+    oosBlock = '\n\nOut-of-sample check (chosen on the first half, judged on the second):\n' +
+      `Best on first half: ${pick.key} — ${pick.s.exp >= 0 ? '+' : ''}${pick.s.exp.toFixed(2)}R ` +
+      `over ${pick.s.n} trades\n` +
+      (after
+        ? `Same setting, second half: ${after.exp >= 0 ? '+' : ''}${after.exp.toFixed(2)}R ` +
+          `over ${after.n} trades\n` +
+          (heldUp
+            ? 'It held up on data it was not chosen on. That is the only result here worth acting on.'
+            : 'It did not hold up. The first-half number was the setting fitting noise, ' +
+              'which is what picking the best of many always risks.')
+        : 'Not enough second-half trades to judge.');
+  }
+
   sendTelegram(
     `Backtest — ${backtest.days.toFixed(0)} days of real Deriv candles, ` +
     `${activeSymbols.length} symbols, threshold ${CONFIDENCE_THRESHOLD}%\n\n` +
@@ -641,7 +693,7 @@ function reportBacktest() {
     `${active.expectancy >= 0 ? '+' : ''}${active.expectancy.toFixed(2)}R per trade\n` +
     `Typical hold ${humanDuration(active.hold.median)} ` +
     `(${humanDuration(active.hold.p25)} to ${humanDuration(active.hold.p75)})\n\n` +
-    `Stop and target comparison:\n${rows}\n\n${mgmtRows}\n\n${advice}`
+    `Stop and target comparison:\n${rows}\n\n${mgmtRows}${oosBlock}\n\n${advice}`
   );
 
   console.log(`[BACKTEST] active ${ACTIVE_VARIANT}: ${active.perDay.toFixed(2)}/day, ` +
