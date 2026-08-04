@@ -674,6 +674,19 @@ function significanceBar(tests) {
     138.357751867269, -30.6647980661472, 2.50662827745924];
   const b = [-54.4760987982241, 161.585836858041, -155.698979859887,
     66.8013118877197, -13.2806815528857];
+  const c = [-0.00778489400243029, -0.322396458041136, -2.40075827716184,
+    -2.54973253934373, 4.37466414146497, 2.93816398269878];
+  const d = [0.00778469570904146, 0.32246712907004, 2.445134137143, 3.75440866190742];
+  // The central rational approximation is only valid for p below about 0.976.
+  // Correcting for many tests pushes p far into the upper tail, so the tail
+  // branch is not optional: without it this returned 3.15 where the true value
+  // is 3.47, understating the bar and letting noise register as a finding.
+  const pl = 0.02425;
+  if (p > 1 - pl) {
+    const q = Math.sqrt(-2 * Math.log(1 - p));
+    return -(((((c[0] * q + c[1]) * q + c[2]) * q + c[3]) * q + c[4]) * q + c[5]) /
+      ((((d[0] * q + d[1]) * q + d[2]) * q + d[3]) * q + 1);
+  }
   const q = p - 0.5, rr = q * q;
   return (((((a[0] * rr + a[1]) * rr + a[2]) * rr + a[3]) * rr + a[4]) * rr + a[5]) * q /
     (((((b[0] * rr + b[1]) * rr + b[2]) * rr + b[3]) * rr + b[4]) * rr + 1);
@@ -721,29 +734,40 @@ function reportStructureScan() {
   const all = scanStats.perSymbol;
   if (!all.length) return;
 
-  const withEdge = all.filter((s) => s.survivors.length);
+  // Each symbol's own bar corrects for the 96 rules tried on that symbol. But
+  // ten symbols were scanned, so the real number of looks is ten times larger
+  // and the bar that matters is the family-wide one. Judging per-symbol would
+  // mean roughly one false finding every run, purely by chance.
+  const totalTests = all.reduce((n, s) => n + s.tested, 0);
+  const familyBar = significanceBar(totalTests);
+  for (const s of all) s.familySurvivors = s.survivors.filter((g) => Math.abs(g.t) > familyBar);
+  const withEdge = all.filter((s) => s.familySurvivors.length);
   const lines = all
     .sort((a, b) => Math.abs(b.best.t) - Math.abs(a.best.t))
     .slice(0, 5)
     .map((s) => `${s.label}: best look ${s.best.L} hold ${s.best.H}, ` +
-      `t ${s.best.t.toFixed(1)} (needs ${s.bar.toFixed(1)}), ` +
-      `${s.survivors.length} rule${s.survivors.length === 1 ? '' : 's'} survive`);
+      `t ${s.best.t.toFixed(2)}, ${s.best.payoff >= 0 ? 'momentum' : 'reversion'}`);
 
+  const momentum = all.filter((s) => s.best.payoff > 0).length;
   const verdict = withEdge.length
-    ? `${withEdge.map((s) => s.label).join(', ')} show at least one rule clearing the bar. ` +
-      'Worth building an entry around - but confirm it holds on a later stretch of ' +
+    ? `${withEdge.map((s) => s.label).join(', ')} clear even the family-wide bar. ` +
+      'That is a real measured edge - but confirm it holds on a later stretch of ' +
       'history before trading it, because a rule found by scanning can still be luck.'
-    : 'No simple entry rule cleared the bar on any symbol. Direction on these ' +
-      'instruments is not predictable from recent direction, which is what a random ' +
-      'walk means. That is why the current EMA/RSI entry loses, and swapping in ' +
-      'different indicators of the same kind will not change it.';
+    : 'Nothing clears the bar on any symbol. Direction on these instruments is not ' +
+      'predictable from recent direction, which is exactly what a random walk means. ' +
+      'That is why the current EMA/RSI entry loses money, and why swapping in other ' +
+      'indicators of the same kind will not change it. Any edge here has to come from ' +
+      'somewhere other than reading recent price direction.';
 
   sendTelegram(
-    `Entry-logic scan — 144 rules per symbol, ${all.length} symbols\n\n` +
+    `Entry-logic scan — ${all[0].tested} rules on each of ${all.length} symbols ` +
+    `(${totalTests} tests)\n\n` +
     `${lines.join('\n')}\n\n` +
-    `"t" measures how far a rule's payoff is from zero. The bar rises with the ` +
-    `number of rules tried, so a rule below it is noise no matter how good the ` +
-    `payoff looks.\n\n${verdict}`
+    `Bar to clear: ${familyBar.toFixed(2)} across all symbols ` +
+    `(${all[0].bar.toFixed(2)} within one). Best result anywhere: ` +
+    `${Math.max(...all.map((s) => Math.abs(s.best.t))).toFixed(2)}.\n` +
+    `Momentum favoured on ${momentum} of ${all.length} symbols, reversion on ` +
+    `${all.length - momentum} — a coin flip either way.\n\n${verdict}`
   );
   console.log(`[SCAN] symbols with surviving rules: ${withEdge.length}/${all.length}`);
 }
