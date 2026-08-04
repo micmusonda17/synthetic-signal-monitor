@@ -19,6 +19,30 @@ const WS_URL = process.env.DERIV_WS_URL
 // 74 was chosen by simulation: it yields roughly 6 signals a day across the
 // full 10-symbol watchlist. Drop to 72 for ~8/day, raise to 78 for ~3/day.
 const CONFIDENCE_THRESHOLD = Number(process.env.CONFIDENCE_THRESHOLD || 74);
+
+// Boom and Crash generate far more signals than the volatility indices - in the
+// last backtest B1000 fired 104 against V50's 35 - because their constant small
+// drift keeps nudging the trend score. Holding them to a higher bar cuts the
+// noise without silencing them, since their engineered spike timing is the only
+// non-random structure in the whole product range.
+// Override per symbol with e.g. SYMBOL_THRESHOLDS="B500:82,C1000:80".
+const SPIKE_THRESHOLD_BUMP = Number(process.env.SPIKE_THRESHOLD_BUMP || 6);
+
+const SYMBOL_THRESHOLDS = (() => {
+  const map = {};
+  for (const label of ['B500', 'B1000', 'C500', 'C1000']) {
+    map[label] = CONFIDENCE_THRESHOLD + SPIKE_THRESHOLD_BUMP;
+  }
+  for (const part of (process.env.SYMBOL_THRESHOLDS || '').split(',')) {
+    const [label, value] = part.split(':').map((s) => (s || '').trim());
+    if (label && Number.isFinite(Number(value))) map[label] = Number(value);
+  }
+  return map;
+})();
+
+function thresholdFor(label) {
+  return SYMBOL_THRESHOLDS[label] ?? CONFIDENCE_THRESHOLD;
+}
 const GRANULARITY = Number(process.env.GRANULARITY_SECONDS || 900); // 900 = M15
 const ALERT_COOLDOWN_MS = Number(process.env.ALERT_COOLDOWN_MINUTES || 15) * 60 * 1000;
 
@@ -516,8 +540,10 @@ function backtestSymbol(code, label, candles) {
 
       const sc = scores[i];
       if (!sc) continue;
-      const strong = sc.confidence >= CONFIDENCE_THRESHOLD;
-      const crossedUp = strong && lastConf < CONFIDENCE_THRESHOLD;
+      // Same per-symbol bar the live monitor uses, so the backtest keeps
+      // reporting what you will actually receive.
+      const strong = sc.confidence >= thresholdFor(label);
+      const crossedUp = strong && lastConf < thresholdFor(label);
       const flipped = strong && lastDir !== null && lastDir !== sc.direction;
       if ((crossedUp || flipped) && (i - lastAlertBar) > cooldownBars) {
         const long = sc.direction === 'BUY';
@@ -1058,8 +1084,9 @@ function evaluateSignal(code, label) {
     closes, ema20Series, ema50Series, rsiVal, atrVal, price,
   });
 
-  const strong = confidence >= CONFIDENCE_THRESHOLD;
-  const crossedUp = strong && st.lastConfidence < CONFIDENCE_THRESHOLD;
+  const bar = thresholdFor(label);
+  const strong = confidence >= bar;
+  const crossedUp = strong && st.lastConfidence < bar;
   const flipped = strong && st.lastDirection !== null && st.lastDirection !== direction;
   const cooledDown = Date.now() - st.lastAlertAt > ALERT_COOLDOWN_MS;
   // One position per symbol. Stacking a second call on V75 while the first is
@@ -1331,7 +1358,8 @@ function connect() {
       console.log('Monitoring:', activeSymbols.map((s) => s.label).join(', '));
       sendTelegram(
         'Monitor live — watching ' + activeSymbols.map((s) => s.label).join(', ') +
-        `\nAlerting above ${CONFIDENCE_THRESHOLD}% confidence, ` +
+        `\nAlerting above ${CONFIDENCE_THRESHOLD}% confidence ` +
+        `(${SPIKE_THRESHOLD_BUMP > 0 ? `${CONFIDENCE_THRESHOLD + SPIKE_THRESHOLD_BUMP}% on Boom/Crash` : 'same on all'}), ` +
         `SL ${SL_ATR_MULT}x ATR / TP ${TP_ATR_MULT}x ATR (${rrLabel}).`
       );
       subscribe(activeSymbols);
@@ -1419,6 +1447,7 @@ if (process.env.PORT) {
       monitoring: activeSymbols.map((s) => s.label),
       symbolsReady: `${ready}/${activeSymbols.length || SYMBOLS.length}`,
       threshold: CONFIDENCE_THRESHOLD,
+      perSymbolThresholds: SYMBOL_THRESHOLDS,
       risk: { slAtrMult: SL_ATR_MULT, tpAtrMult: TP_ATR_MULT, rr: rrLabel, timeStopBars: TIME_STOP_BARS },
       hold: holdGuidance(),
       backtest: {
