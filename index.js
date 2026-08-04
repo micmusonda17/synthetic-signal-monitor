@@ -36,6 +36,33 @@ const TREND_DIV = Number(process.env.TREND_DIV || 3.0);
 const SLOPE_DIV = Number(process.env.SLOPE_DIV || 1.4);
 const ENTRY_DIV = Number(process.env.ENTRY_DIV || 2.5);
 
+// ---- Risk management ----
+// Position size is reported in risk-per-point rather than lots, because lot size
+// depends on each instrument's contract specification and getting that wrong is
+// worse than not stating it. Set ACCOUNT_BALANCE to your real balance and this
+// becomes a concrete figure instead of a percentage.
+const ACCOUNT_BALANCE = Number(process.env.ACCOUNT_BALANCE || 0);
+const RISK_PERCENT = Number(process.env.RISK_PERCENT || 1);
+const ACCOUNT_CURRENCY = (process.env.ACCOUNT_CURRENCY || 'USD').trim();
+
+// Stops opening anything new once the day is far enough underwater. Counted in R
+// so it is independent of position size. Resets at UTC midnight.
+const DAILY_LOSS_LIMIT_R = Number(process.env.DAILY_LOSS_LIMIT_R || 3);
+// Ten symbols each holding a position means ten times the risk at once.
+const MAX_OPEN_TRADES = Number(process.env.MAX_OPEN_TRADES || 3);
+
+// Move the stop to entry once the trade is this far in profit, then trail it.
+// Both default to OFF because the backtest says they hurt: on a series with no
+// drift, price reaching +1R is no more likely to continue than to reverse, so
+// break-even converts eventual 2R winners into 0R scratches while doing nothing
+// about losses that run straight to the stop. Measured expectancy went from
+// -0.217R (fixed) to -0.220R (break-even) to -0.233R (break-even plus trail),
+// with the win rate halving. The startup sweep re-measures this on your own
+// data every restart - turn them on only if that sweep disagrees.
+const BREAKEVEN_AT_R = Number(process.env.BREAKEVEN_AT_R ?? 0);
+const TRAIL_AFTER_R = Number(process.env.TRAIL_AFTER_R ?? 0);
+const TRAIL_DISTANCE_R = Number(process.env.TRAIL_DISTANCE_R || 1);
+
 // A trade that has gone nowhere is not a trade, it is exposure. After this many
 // candles the monitor stops waiting and tells you to close it. 24 M15 candles
 // is 6 hours, which in simulation covers about 90% of trades that resolve.
@@ -69,8 +96,14 @@ const SPIKE_META = {
 // and these instruments tick once a second, so one batch is about 17 minutes.
 // 60 batches is roughly 17 hours per symbol, which yields well over 100 spikes
 // on the 500-series and enough on the 1000-series to say something.
-const SPIKE_BATCHES = Number(process.env.SPIKE_BATCHES || 60);
+const SPIKE_BATCHES = Number(process.env.SPIKE_BATCHES || 80);
+const SPIKE_MIN_GAPS = Number(process.env.SPIKE_MIN_GAPS || 80);
 const SPIKE_BATCH_SIZE = Number(process.env.SPIKE_BATCH_SIZE || 1000);
+
+// Deriv rate-limits ticks_history. Requests are drained from a single queue at
+// this interval; the interval widens automatically if Deriv still pushes back.
+const SPIKE_REQUEST_MS = Number(process.env.SPIKE_REQUEST_MS || 2000);
+const SPIKE_MAX_RETRIES = Number(process.env.SPIKE_MAX_RETRIES || 6);
 const SPIKE_MULT = Number(process.env.SPIKE_MULT || 8);
 
 const SYMBOLS = [
@@ -238,6 +271,99 @@ const rrLabel = (() => {
   return `1:${Number.isInteger(rr) ? rr : rr.toFixed(1)}`;
 })();
 
+// ---- Trade management ----
+// Shared by the live monitor and the backtest so the two cannot drift apart.
+// Returns where the stop should sit from the NEXT bar onward. Deliberately not
+// applied to the current bar: if one candle both reaches the break-even trigger
+// and touches the original stop, there is no way to know which came first, and
+// assuming the favourable order would flatter every reported result.
+function manageStop(open, bar, cfg) {
+  const long = open.dir === 'BUY';
+  const best = long ? bar.high : bar.low;
+  const movedR = (long ? best - open.entry : open.entry - best) / open.risk;
+  let sl = open.sl;
+
+  if (cfg.beAtR > 0 && movedR >= cfg.beAtR) {
+    sl = long ? Math.max(sl, open.entry) : Math.min(sl, open.entry);
+  }
+  if (cfg.trailAfterR > 0 && movedR >= cfg.trailAfterR) {
+    const trail = long
+      ? best - cfg.trailDistR * open.risk
+      : best + cfg.trailDistR * open.risk;
+    sl = long ? Math.max(sl, trail) : Math.min(sl, trail);
+  }
+  return sl;
+}
+
+const LIVE_MGMT = {
+  beAtR: BREAKEVEN_AT_R, trailAfterR: TRAIL_AFTER_R, trailDistR: TRAIL_DISTANCE_R,
+};
+
+// ---- Daily risk budget ----
+// Counted in R so it does not depend on position size, and reset on the UTC day
+// boundary. Without this the bot happily keeps firing through a losing streak.
+const daily = { day: null, r: 0, announced: false, entries: 0, tp: 0, sl: 0, timeout: 0 };
+// Kept since the process started, so a single good or bad day cannot be mistaken
+// for the trend. Resets on restart, which the summary says out loud.
+const career = { days: 0, r: 0, tp: 0, sl: 0, timeout: 0, since: new Date(Date.now()).toISOString().slice(0, 10) };
+
+function rollDay() {
+  const key = new Date(Date.now()).toISOString().slice(0, 10);
+  if (daily.day === key) return;
+  const closed = daily.tp + daily.sl + daily.timeout;
+  if (daily.day !== null && closed > 0) sendDailySummary(closed);
+  daily.day = key;
+  daily.r = 0; daily.announced = false;
+  daily.entries = 0; daily.tp = 0; daily.sl = 0; daily.timeout = 0;
+}
+
+// The point of this is not encouragement. It is to make the running result
+// visible as a number, so a losing run is obvious early rather than felt late.
+function sendDailySummary(closed) {
+  career.days += 1;
+  career.r += daily.r;
+  career.tp += daily.tp; career.sl += daily.sl; career.timeout += daily.timeout;
+  const careerClosed = career.tp + career.sl + career.timeout;
+  const winRate = closed ? (100 * daily.tp) / closed : 0;
+  const avg = closed ? daily.r / closed : 0;
+
+  sendTelegram(
+    `Daily summary — ${daily.day}\n\n` +
+    `Trades closed: ${closed}\n` +
+    `Hit target: ${daily.tp} · Hit stop: ${daily.sl} · Timed out: ${daily.timeout}\n` +
+    `Win rate: ${winRate.toFixed(0)}%\n` +
+    `Net: ${daily.r >= 0 ? '+' : ''}${daily.r.toFixed(1)}R ` +
+    `(${avg >= 0 ? '+' : ''}${avg.toFixed(2)}R per trade)\n\n` +
+    `Since ${career.since}: ${careerClosed} trades over ${career.days} day` +
+    `${career.days === 1 ? '' : 's'}, ` +
+    `${career.r >= 0 ? '+' : ''}${career.r.toFixed(1)}R total ` +
+    `(${careerClosed ? (career.r / careerClosed >= 0 ? '+' : '') + (career.r / careerClosed).toFixed(2) : '0.00'}R per trade)\n\n` +
+    'Break-even needs better than +0.00R per trade. Counts restart when the bot restarts.'
+  );
+  console.log(`[DAILY] ${daily.day}: ${closed} closed, ${daily.r.toFixed(2)}R | ` +
+    `career ${careerClosed} trades ${career.r.toFixed(2)}R`);
+}
+
+function recordDailyR(r) { rollDay(); daily.r += r; }
+
+function dailyLimitHit() {
+  rollDay();
+  return DAILY_LOSS_LIMIT_R > 0 && daily.r <= -DAILY_LOSS_LIMIT_R;
+}
+
+// Reports risk per point rather than a lot size, because contract size differs
+// per instrument and a confidently wrong lot figure is worse than none.
+function positionSizeLine(stopDistance, decimals) {
+  if (!(ACCOUNT_BALANCE > 0) || !(stopDistance > 0)) {
+    return `Size   risk ${RISK_PERCENT}% of account (set ACCOUNT BALANCE for the figure)`;
+  }
+  const riskAmount = (ACCOUNT_BALANCE * RISK_PERCENT) / 100;
+  const perPoint = riskAmount / stopDistance;
+  return `Size   risk ${riskAmount.toFixed(2)} ${ACCOUNT_CURRENCY} ` +
+    `(${RISK_PERCENT}%) over ${stopDistance.toFixed(decimals)} pts = ` +
+    `${perPoint.toFixed(4)} per point`;
+}
+
 // ---- Hold-time guidance ----
 // Candle counts are meaningless to read at a glance, so everything the user
 // sees is expressed in wall-clock time derived from the configured granularity.
@@ -293,8 +419,19 @@ function blankVariant() {
   return { signals: 0, tp: 0, sl: 0, timeout: 0, sumR: 0, bars: [] };
 }
 
+// Does letting the stop move actually help? With a 27% win rate the intuition is
+// that break-even should convert losers into scratches, but intuition is exactly
+// what this project keeps getting wrong, so it gets measured alongside the rest.
+const MGMT_VARIANTS = [
+  { key: 'fixed stop', cfg: null },
+  { key: 'break-even at 1R', cfg: { beAtR: 1, trailAfterR: 0, trailDistR: 0 } },
+  { key: 'break-even + trail', cfg: { beAtR: 1, trailAfterR: 1.5, trailDistR: 1 } },
+  { key: 'break-even at 0.5R', cfg: { beAtR: 0.5, trailAfterR: 0, trailDistR: 0 } },
+];
+
 const backtest = {
   done: 0, days: 0, reported: false,
+  mgmt: Object.fromEntries(MGMT_VARIANTS.map((m) => [m.key, blankVariant()])),
   variants: Object.fromEntries(RISK_VARIANTS.map((v) => [variantKey(v), blankVariant()])),
   get active() { return this.variants[ACTIVE_VARIANT] || blankVariant(); },
   get signals() { return this.active.signals; },
@@ -338,8 +475,10 @@ function backtestSymbol(code, label, candles) {
     scores[i] = { confidence, direction, atrVal, price };
   }
 
-  for (const v of RISK_VARIANTS) {
-    const acc = backtest.variants[variantKey(v)];
+  // One replay engine, driven by a risk setting and a management mode, so the
+  // stop/target sweep and the break-even sweep cannot disagree with each other
+  // or with the live monitor.
+  const replay = (slMult, tpMult, mgmt, acc) => {
     let lastConf = 0, lastDir = null, lastAlertBar = -1e9, open = null;
 
     for (let i = 60; i < candles.length; i++) {
@@ -356,19 +495,21 @@ function backtestSymbol(code, label, candles) {
         if (hitSl) out = 'SL';
         else if (hitTp) out = 'TP';
         else if (held >= TIME_STOP_BARS) out = 'TIME';
+
         if (out) {
-          if (out === 'TP') { acc.tp++; acc.sumR += v.tp / v.sl; }
-          else if (out === 'SL') { acc.sl++; acc.sumR -= 1; }
-          else {
-            acc.timeout++;
-            // A timed-out trade is closed at market, so credit its real result
-            // rather than pretending it was flat.
-            const move = long ? bar.close - open.entry : open.entry - bar.close;
-            acc.sumR += move / open.risk;
-          }
+          // Measure the realised result rather than assuming a full win or loss:
+          // once the stop can move, "stop hit" no longer means exactly -1R.
+          const exit = out === 'SL' ? open.sl : out === 'TP' ? open.tp : bar.close;
+          const r = (long ? exit - open.entry : open.entry - exit) / open.risk;
+          if (out === 'TP') acc.tp++;
+          else if (out === 'SL') acc.sl++;
+          else acc.timeout++;
+          acc.sumR += r;
           if (out !== 'TIME') acc.bars.push(held);
           open = null;
           lastAlertBar = i;
+        } else if (mgmt) {
+          open.sl = manageStop(open, bar, mgmt);
         }
         continue;
       }
@@ -380,8 +521,8 @@ function backtestSymbol(code, label, candles) {
       const flipped = strong && lastDir !== null && lastDir !== sc.direction;
       if ((crossedUp || flipped) && (i - lastAlertBar) > cooldownBars) {
         const long = sc.direction === 'BUY';
-        const risk = v.sl * sc.atrVal;
-        const reward = v.tp * sc.atrVal;
+        const risk = slMult * sc.atrVal;
+        const reward = tpMult * sc.atrVal;
         open = {
           i, dir: sc.direction, entry: sc.price, risk,
           sl: long ? sc.price - risk : sc.price + risk,
@@ -392,7 +533,13 @@ function backtestSymbol(code, label, candles) {
       lastConf = sc.confidence;
       lastDir = sc.direction;
     }
-  }
+  };
+
+  // Stop/target sweep, all with fixed stops so the comparison is clean.
+  for (const v of RISK_VARIANTS) replay(v.sl, v.tp, null, backtest.variants[variantKey(v)]);
+  // Management sweep, held at the configured stop/target so the only thing
+  // changing is whether the stop is allowed to move.
+  for (const m of MGMT_VARIANTS) replay(SL_ATR_MULT, TP_ATR_MULT, m.cfg, backtest.mgmt[m.key]);
 
   const spanDays = (candles.at(-1).time - candles[0].time) / 86400;
   backtest.done += 1;
@@ -438,6 +585,21 @@ function reportBacktest() {
     })
     .join('\n');
 
+  const mgmtSummaries = MGMT_VARIANTS.map((m) => {
+    const a = backtest.mgmt[m.key];
+    const closed = a.tp + a.sl + a.timeout;
+    return closed ? { key: m.key, closed, expectancy: a.sumR / closed, winRate: (100 * a.tp) / closed } : null;
+  }).filter(Boolean);
+
+  const mgmtRows = mgmtSummaries.length
+    ? 'Stop management comparison (same levels, only the stop rule changes):\n' +
+      mgmtSummaries
+        .sort((a, b) => b.expectancy - a.expectancy)
+        .map((s) => `${s.key} — win ${s.winRate.toFixed(0)}%, ` +
+          `${s.expectancy >= 0 ? '+' : ''}${s.expectancy.toFixed(2)}R/trade`)
+        .join('\n')
+    : '';
+
   const advice = best.key === ACTIVE_VARIANT
     ? 'Your current levels came out best of those tested.'
     : `Better on this data: SL ${best.key.split('/')[0]}x TP ${best.key.split('/')[1]}x ` +
@@ -453,11 +615,137 @@ function reportBacktest() {
     `${active.expectancy >= 0 ? '+' : ''}${active.expectancy.toFixed(2)}R per trade\n` +
     `Typical hold ${humanDuration(active.hold.median)} ` +
     `(${humanDuration(active.hold.p25)} to ${humanDuration(active.hold.p75)})\n\n` +
-    `Stop and target comparison:\n${rows}\n\n${advice}`
+    `Stop and target comparison:\n${rows}\n\n${mgmtRows}\n\n${advice}`
   );
 
   console.log(`[BACKTEST] active ${ACTIVE_VARIANT}: ${active.perDay.toFixed(2)}/day, ` +
     `win ${active.winRate.toFixed(1)}%, exp ${active.expectancy.toFixed(3)}R | best ${best.key}`);
+}
+
+// ---- Structure scan ----
+// Rather than guessing at another indicator combination, this asks the prior
+// question: does ANY simple "look back L bars, hold H bars" rule have an edge on
+// this instrument? It scans 144 of them in both directions and reports what
+// survives. Two details make it honest rather than flattering:
+//   - forward windows never overlap, because overlapping windows share the same
+//     moves and inflate significance, which is how naive scans find edges in noise
+//   - the bar a result must clear rises with the number of rules tried, since
+//     testing 144 things guarantees some look good by luck
+// Calibrated against 25 simulated random walks: zero false survivors.
+const scanStats = { done: 0, perSymbol: [], reported: false };
+
+function meanOf(xs) { return xs.reduce((a, b) => a + b, 0) / (xs.length || 1); }
+
+function sdOf(xs) {
+  if (xs.length < 2) return 0;
+  const m = meanOf(xs);
+  return Math.sqrt(xs.reduce((a, b) => a + (b - m) ** 2, 0) / (xs.length - 1));
+}
+
+function autocorrOf(r, lag) {
+  const n = r.length - lag;
+  if (n < 30) return null;
+  const a = r.slice(0, n), b = r.slice(lag, lag + n);
+  const ma = meanOf(a), mb = meanOf(b);
+  let num = 0, da = 0, db = 0;
+  for (let i = 0; i < n; i++) {
+    const x = a[i] - ma, y = b[i] - mb;
+    num += x * y; da += x * x; db += y * y;
+  }
+  return da && db ? num / Math.sqrt(da * db) : null;
+}
+
+// A random walk's variance grows linearly with horizon, so this sits at 1.0.
+// Above 1 means moves extend; below 1 means they get partly undone.
+function varianceRatioOf(r, q) {
+  if (r.length < q * 30) return null;
+  const v1 = sdOf(r) ** 2;
+  const agg = [];
+  for (let i = 0; i + q <= r.length; i += q) agg.push(r.slice(i, i + q).reduce((a, b) => a + b, 0));
+  const vq = sdOf(agg) ** 2;
+  return v1 > 0 ? vq / (q * v1) : null;
+}
+
+// Bonferroni-style threshold: the largest |t| you should expect from pure noise
+// after looking at this many rules.
+function significanceBar(tests) {
+  const p = 1 - 0.05 / (2 * Math.max(tests, 1));
+  const a = [-39.6968302866538, 220.946098424521, -275.928510446969,
+    138.357751867269, -30.6647980661472, 2.50662827745924];
+  const b = [-54.4760987982241, 161.585836858041, -155.698979859887,
+    66.8013118877197, -13.2806815528857];
+  const q = p - 0.5, rr = q * q;
+  return (((((a[0] * rr + a[1]) * rr + a[2]) * rr + a[3]) * rr + a[4]) * rr + a[5]) * q /
+    (((((b[0] * rr + b[1]) * rr + b[2]) * rr + b[3]) * rr + b[4]) * rr + 1);
+}
+
+function structureScan(label, candles) {
+  const closes = candles.map((c) => c.close);
+  const r = [];
+  for (let i = 1; i < closes.length; i++) r.push(closes[i] - closes[i - 1]);
+  const scale = sdOf(r) || 1;
+
+  const grid = [];
+  for (let L = 1; L <= 12; L++) {
+    for (let H = 1; H <= 12; H++) {
+      const payoffs = [];
+      for (let i = L; i + H <= r.length; i += H) {
+        const past = r.slice(i - L, i).reduce((a, b) => a + b, 0);
+        if (past === 0) continue;
+        payoffs.push(Math.sign(past) * r.slice(i, i + H).reduce((a, b) => a + b, 0));
+      }
+      if (payoffs.length < 120) continue;
+      const m = meanOf(payoffs), s = sdOf(payoffs);
+      if (!(s > 0)) continue;
+      grid.push({ L, H, n: payoffs.length, payoff: m / scale, t: m / (s / Math.sqrt(payoffs.length)) });
+    }
+  }
+  if (!grid.length) return;
+
+  const bar = significanceBar(grid.length);
+  const best = grid.reduce((a, b) => (Math.abs(b.t) > Math.abs(a.t) ? b : a));
+  const survivors = grid.filter((g) => Math.abs(g.t) > bar);
+
+  scanStats.done += 1;
+  scanStats.perSymbol.push({
+    label, bars: closes.length, tested: grid.length, bar, best, survivors,
+    ac1: autocorrOf(r, 1), vr8: varianceRatioOf(r, 8),
+  });
+  console.log(`[SCAN] ${label}: ${grid.length} rules, best L${best.L}/H${best.H} ` +
+    `t=${best.t.toFixed(2)} (bar ${bar.toFixed(2)}), survivors ${survivors.length}`);
+}
+
+function reportStructureScan() {
+  if (scanStats.reported || !activeSymbols.length || scanStats.done < activeSymbols.length) return;
+  scanStats.reported = true;
+  const all = scanStats.perSymbol;
+  if (!all.length) return;
+
+  const withEdge = all.filter((s) => s.survivors.length);
+  const lines = all
+    .sort((a, b) => Math.abs(b.best.t) - Math.abs(a.best.t))
+    .slice(0, 5)
+    .map((s) => `${s.label}: best look ${s.best.L} hold ${s.best.H}, ` +
+      `t ${s.best.t.toFixed(1)} (needs ${s.bar.toFixed(1)}), ` +
+      `${s.survivors.length} rule${s.survivors.length === 1 ? '' : 's'} survive`);
+
+  const verdict = withEdge.length
+    ? `${withEdge.map((s) => s.label).join(', ')} show at least one rule clearing the bar. ` +
+      'Worth building an entry around - but confirm it holds on a later stretch of ' +
+      'history before trading it, because a rule found by scanning can still be luck.'
+    : 'No simple entry rule cleared the bar on any symbol. Direction on these ' +
+      'instruments is not predictable from recent direction, which is what a random ' +
+      'walk means. That is why the current EMA/RSI entry loses, and swapping in ' +
+      'different indicators of the same kind will not change it.';
+
+  sendTelegram(
+    `Entry-logic scan — 144 rules per symbol, ${all.length} symbols\n\n` +
+    `${lines.join('\n')}\n\n` +
+    `"t" measures how far a rule's payoff is from zero. The bar rises with the ` +
+    `number of rules tried, so a rule below it is noise no matter how good the ` +
+    `payoff looks.\n\n${verdict}`
+  );
+  console.log(`[SCAN] symbols with surviving rules: ${withEdge.length}/${all.length}`);
 }
 
 // ---- Boom/Crash spike lab ----
@@ -540,7 +828,11 @@ function memorylessTest(gaps, bucketSize = 100) {
   // positives roughly one run in six. Claiming an edge that is not there is the
   // expensive mistake here, so the coefficient of variation - which uses every
   // gap rather than the tail - has to back it up.
-  const enough = gaps.length >= 30;
+  // Sample size is not a formality here. With around 30 gaps the hazard estimate
+  // is noisy enough to report an edge on a series that is provably memoryless,
+  // which is exactly the mistake that costs money. 80 gaps is where the
+  // false-positive rate drops to roughly nothing in simulation.
+  const enough = gaps.length >= SPIKE_MIN_GAPS;
   const verdict = !enough ? 'INSUFFICIENT'
     : (cv < 0.75 && ratio > 1.2) ? 'EDGE'
     : (cv < 0.9 && ratio > 1.1) ? 'WEAK' : 'NO EDGE';
@@ -548,12 +840,67 @@ function memorylessTest(gaps, bucketSize = 100) {
     minGap: Math.min(...gaps), n: gaps.length, verdict };
 }
 
-const spikeLab = { symbols: {}, pending: 0, reported: false };
+const spikeLab = {
+  symbols: {}, pending: 0, reported: false,
+  queue: [], timer: null, intervalMs: SPIKE_REQUEST_MS, rateLimitHits: 0,
+};
 
 function requestSpikeHistory(code, end) {
   ws.send(JSON.stringify({
     ticks_history: code, style: 'ticks', count: SPIKE_BATCH_SIZE, end: end || 'latest',
   }));
+}
+
+// Deriv rate-limits ticks_history, and firing four symbols in parallel trips it
+// within seconds. Everything goes through one queue drained at a fixed interval
+// so the pacing is global rather than per symbol, and the interval widens on its
+// own if Deriv still objects.
+function enqueueSpike(code, end, attempt = 0) {
+  spikeLab.queue.push({ code, end, attempt });
+  pumpSpikeQueue();
+}
+
+function pumpSpikeQueue() {
+  if (spikeLab.timer) return;
+  spikeLab.timer = setInterval(() => {
+    const job = spikeLab.queue.shift();
+    if (!job) {
+      clearInterval(spikeLab.timer);
+      spikeLab.timer = null;
+      return;
+    }
+    requestSpikeHistory(job.code, job.end);
+    spikeLab.inFlight = job;
+  }, spikeLab.intervalMs);
+}
+
+function restartSpikeQueue() {
+  if (spikeLab.timer) { clearInterval(spikeLab.timer); spikeLab.timer = null; }
+  pumpSpikeQueue();
+}
+
+// Called when Deriv rejects a tick request. Without this the symbol would sit
+// pending forever and the report would never fire.
+function onSpikeError(code, errorCode) {
+  const st = spikeLab.symbols[code];
+  if (!st || st.done) return;
+  const job = spikeLab.inFlight;
+  const attempt = (job && job.code === code ? job.attempt : 0) + 1;
+
+  if (errorCode === 'RateLimit' && attempt <= SPIKE_MAX_RETRIES) {
+    spikeLab.rateLimitHits += 1;
+    spikeLab.intervalMs = Math.min(15000, Math.round(spikeLab.intervalMs * 1.8));
+    restartSpikeQueue();
+    console.log(`[SPIKE] ${st.label} rate limited, slowing to ${spikeLab.intervalMs}ms ` +
+      `(attempt ${attempt}/${SPIKE_MAX_RETRIES})`);
+    enqueueSpike(code, st.oldest === null ? undefined : st.oldest - 1, attempt);
+    return;
+  }
+
+  // Out of retries, or a different error entirely: finish with whatever this
+  // symbol managed to collect rather than hanging the whole report.
+  console.error(`[SPIKE] ${st.label} giving up after ${st.batches} batches (${errorCode})`);
+  finishSpikeSymbol(code);
 }
 
 function startSpikeLab(list) {
@@ -564,11 +911,12 @@ function startSpikeLab(list) {
       label: s.label, meta, quotes: [], batches: 0, oldest: null, done: false,
     };
     spikeLab.pending += 1;
-    requestSpikeHistory(s.code);
+    enqueueSpike(s.code);
   }
   if (spikeLab.pending) {
-    console.log(`[SPIKE] collecting ${SPIKE_BATCHES} x 5000 ticks for ` +
-      Object.values(spikeLab.symbols).map((s) => s.label).join(', '));
+    console.log(`[SPIKE] queued ${SPIKE_BATCHES} x ${SPIKE_BATCH_SIZE} ticks for ` +
+      Object.values(spikeLab.symbols).map((s) => s.label).join(', ') +
+      ` at ${spikeLab.intervalMs}ms per request`);
   }
 }
 
@@ -587,10 +935,16 @@ function onSpikeHistory(code, prices, times) {
   const movedBack = st.oldest === null || newOldest < st.oldest;
   st.oldest = newOldest;
   if (st.batches < SPIKE_BATCHES && prices.length >= 100 && movedBack) {
-    setTimeout(() => requestSpikeHistory(code, newOldest - 1), 120);
+    enqueueSpike(code, newOldest - 1);
     return;
   }
 
+  finishSpikeSymbol(code);
+}
+
+function finishSpikeSymbol(code) {
+  const st = spikeLab.symbols[code];
+  if (!st || st.done) return;
   st.done = true;
   spikeLab.pending -= 1;
   const det = detectSpikes(st.quotes, st.meta.dir);
@@ -621,10 +975,29 @@ function reportSpikeLab() {
       `spread ${r.cv.toFixed(2)}, waiting-pays ${ratio} - ${r.verdict}`;
   });
 
-  const anyEdge = all.some((s) => s.result.usable && s.result.verdict !== 'NO EDGE');
-  const conclusion = anyEdge
-    ? 'At least one symbol shows a rising spike probability. Counting ticks is worth building a strategy around - ask for the entry rules next.'
-    : 'Every symbol looks memoryless: the chance of a spike on the next tick does not rise as you wait. Counting ticks cannot produce an edge here, and any bot claiming otherwise is selling you a coin flip.';
+  // "Not enough data" is not the same as "no edge", and neither is it evidence
+  // of one. Conflating them would be the most misleading thing this report could
+  // do, so all three outcomes get their own conclusion.
+  const strong = all.filter((s) => s.result.usable && s.result.verdict === 'EDGE');
+  const weak = all.filter((s) => s.result.usable && s.result.verdict === 'WEAK');
+  const judged = all.filter((s) => s.result.usable && s.result.verdict !== 'INSUFFICIENT');
+
+  // In simulation this test never once called a memoryless series EDGE, but it
+  // did return WEAK on about 7% of them. So WEAK is reported as unresolved
+  // rather than as a finding - acting on it would be acting on noise.
+  const conclusion = strong.length
+    ? `${strong.map((s) => s.label).join(', ')} show a spike probability that genuinely rises ` +
+      'as you wait. That is the one place a real edge could live here - ask for entry rules next.'
+    : weak.length
+      ? `${weak.map((s) => s.label).join(', ')} came out borderline. Roughly one in fourteen ` +
+        'purely random runs looks like this, so it is not yet a finding. Collect more history ' +
+        'before treating it as one.'
+      : judged.length
+        ? 'Every symbol with enough data looks memoryless: the chance of a spike on the next ' +
+          'tick does not rise as you wait. Counting ticks cannot produce an edge here, and any ' +
+          'bot claiming otherwise is selling you a coin flip.'
+        : 'Not enough spikes collected to judge either way. That is missing data, not evidence ' +
+          `of no edge. Raise SPIKE BATCHES above ${SPIKE_BATCHES} and restart to gather more.`;
 
   sendTelegram(
     `Spike analysis - Boom/Crash, ${all[0].ticks} ticks each\n\n` +
@@ -669,8 +1042,24 @@ function evaluateSignal(code, label) {
   // still open doubles the risk on a single instrument and is the main reason
   // the old build felt noisy — the same trend kept re-announcing itself.
   const free = !st.open;
+  const openCount = Object.values(state).filter((s) => s.open).length;
+  const roomToTrade = openCount < MAX_OPEN_TRADES;
+  const budgetLeft = !dailyLimitHit();
 
-  if (free && (crossedUp || flipped) && cooledDown) {
+  // Announce the daily stop once, so you know why the alerts went quiet rather
+  // than wondering whether the bot died.
+  if (!budgetLeft && !daily.announced) {
+    daily.announced = true;
+    sendTelegram(
+      `Daily loss limit reached: ${daily.r.toFixed(1)}R today ` +
+      `(limit ${DAILY_LOSS_LIMIT_R}R).\n\n` +
+      'No new signals until the UTC day rolls over. Open trades are still tracked ' +
+      'and will report as normal.'
+    );
+    console.log(`[RISK] daily limit hit at ${daily.r.toFixed(2)}R, pausing new entries`);
+  }
+
+  if (free && budgetLeft && roomToTrade && (crossedUp || flipped) && cooledDown) {
     const { entry, sl, tp, risk, reward } = levelsFor(direction, price, atrVal);
     const d = st.decimals ?? 2;
     const arrow = direction === 'BUY' ? '\u{1F7E2}' : '\u{1F534}';
@@ -681,9 +1070,14 @@ function evaluateSignal(code, label) {
       `Entry  ${entry.toFixed(d)}\n` +
       `SL     ${sl.toFixed(d)}  (${direction === 'BUY' ? '-' : '+'}${risk.toFixed(d)})\n` +
       `TP     ${tp.toFixed(d)}  (${direction === 'BUY' ? '+' : '-'}${reward.toFixed(d)})\n` +
-      `R:R    ${rrLabel}\n\n` +
+      `R:R    ${rrLabel}\n` +
+      `${positionSizeLine(risk, d)}\n\n` +
       `Hold   about ${humanDuration(g.median)}, usually ${humanDuration(g.p25)} to ${humanDuration(g.p75)}\n` +
-      `Close  after ${humanDuration(TIME_STOP_BARS)} if neither level is hit\n\n` +
+      `Close  after ${humanDuration(TIME_STOP_BARS)} if neither level is hit\n` +
+      (BREAKEVEN_AT_R > 0
+        ? `Stop   moves to entry at +${BREAKEVEN_AT_R}R, then trails ${TRAIL_DISTANCE_R}R behind\n`
+        : '') +
+      '\n' +
       `*Confidence ${confidence}%*\n` +
       `RSI(14) ${rsiVal.toFixed(1)} · ATR(14) ${atrVal.toFixed(d)}`,
       { markdown: true }
@@ -693,6 +1087,8 @@ function evaluateSignal(code, label) {
       direction, entry, sl, tp, risk, confidence,
       bars: 0, openedAt: Date.now(), openBarTime: st.candles.at(-1).time,
     };
+    rollDay();
+    daily.entries += 1;
     console.log(
       `[ALERT] ${label} ${direction} @ ${confidence}% ` +
       `entry=${entry.toFixed(d)} sl=${sl.toFixed(d)} tp=${tp.toFixed(d)} ` +
@@ -736,7 +1132,29 @@ function checkOpenTrade(code, label) {
   if (hitSl) { outcome = 'SL'; exit = o.sl; }
   else if (hitTp) { outcome = 'TP'; exit = o.tp; }
   else if (o.bars >= TIME_STOP_BARS) { outcome = 'TIME'; exit = bar.close; }
-  if (!outcome) return;
+
+  if (!outcome) {
+    // Still open: advance the stop for subsequent bars. Announce the move to
+    // break-even once, because it changes the trade from risking 1R to risking
+    // nothing and that is worth knowing.
+    const moved = manageStop({ ...o, dir: o.direction }, bar, LIVE_MGMT);
+    if (moved !== o.sl) {
+      const wasAtRisk = long ? o.sl < o.entry : o.sl > o.entry;
+      const nowSafe = long ? moved >= o.entry : moved <= o.entry;
+      o.sl = moved;
+      if (wasAtRisk && nowSafe && !o.beAnnounced) {
+        o.beAnnounced = true;
+        sendTelegram(
+          `🛡 *STOP TO BREAK EVEN* — ${label} ${o.direction}\n\n` +
+          `Entry  ${o.entry.toFixed(st.decimals ?? 2)}\n` +
+          `Stop   ${moved.toFixed(st.decimals ?? 2)}\n` +
+          'This trade can no longer lose.',
+          { markdown: true }
+        );
+      }
+    }
+    return;
+  }
 
   const d = st.decimals ?? 2;
   const rMultiple = ((long ? exit - o.entry : o.entry - exit) / o.risk);
@@ -748,8 +1166,16 @@ function checkOpenTrade(code, label) {
   else outcomes.timeout += 1;
   // Timed-out trades never reached a level, so they would skew the hold stats.
   if (outcome !== 'TIME') outcomes.resolvedBars.push(o.bars);
+  recordDailyR(rMultiple);
+  if (outcome === 'TP') daily.tp += 1;
+  else if (outcome === 'SL') daily.sl += 1;
+  else daily.timeout += 1;
 
+  // A stop that has been trailed into profit is not a loss, and calling it one
+  // would make the day's tally read wrong.
+  const trailedOut = outcome === 'SL' && rMultiple >= 0;
   const header = outcome === 'TP' ? '✅ *TARGET HIT*'
+    : trailedOut ? '🛡 *TRAILED OUT*'
     : outcome === 'SL' ? '❌ *STOP HIT*'
     : '⏰ *TIME STOP*';
   const closer = outcome === 'TIME'
@@ -851,8 +1277,15 @@ function connect() {
       return;
     }
     if (data.error) {
+      const reqCode = data.echo_req?.ticks_history;
+      // A failed tick request belongs to the spike lab and must be retried or
+      // retired, otherwise that symbol stays pending and the report never fires.
+      if (reqCode && spikeLab.symbols[reqCode] && data.echo_req?.style === 'ticks') {
+        onSpikeError(reqCode, data.error.code);
+        return;
+      }
       console.error('Deriv error:', data.error.code, data.error.message,
-        '| requested symbol:', data.echo_req?.ticks_history);
+        '| requested symbol:', reqCode);
       return;
     }
 
@@ -906,7 +1339,9 @@ function connect() {
       // from this instrument's actual behaviour, which beats any assumption
       // about what a synthetic index does.
       backtestSymbol(reqSymbol, labels[reqSymbol] || reqSymbol, full);
+      structureScan(labels[reqSymbol] || reqSymbol, full);
       reportBacktest();
+      reportStructureScan();
       st.candles = full.slice(-150);
       evaluateSignal(reqSymbol, labels[reqSymbol] || reqSymbol);
     }
@@ -969,6 +1404,15 @@ if (process.env.PORT) {
         tp: backtest.tp, sl: backtest.sl, timeout: backtest.timeout,
       },
       liveOutcomes: { tp: outcomes.tp, sl: outcomes.sl, timeout: outcomes.timeout },
+      today: {
+        date: daily.day, entries: daily.entries, tp: daily.tp, sl: daily.sl,
+        timeout: daily.timeout, netR: +daily.r.toFixed(2),
+        dailyLimitR: DAILY_LOSS_LIMIT_R, paused: dailyLimitHit(),
+      },
+      sinceStart: {
+        from: career.since, days: career.days, netR: +career.r.toFixed(2),
+        tp: career.tp, sl: career.sl, timeout: career.timeout,
+      },
       spikeAnalysis: Object.fromEntries(
         Object.values(spikeLab.symbols).filter((s) => s.done).map((s) => [s.label, {
           ticks: s.ticks, spikes: s.spikes, nominalGap: s.meta.nominal,
