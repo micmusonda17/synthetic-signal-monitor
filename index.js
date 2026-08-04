@@ -606,6 +606,23 @@ function backtestSymbol(code, label, candles) {
 
 // Reported once, after every symbol has been replayed, so the user gets a single
 // honest summary of what these settings would have produced recently.
+// The honest test: choose the setting using only the first half of the history,
+// then judge it on the second half it never saw. Exposed here rather than buried
+// in the Telegram message so it can be read from the health page at any time.
+function outOfSampleResult() {
+  const expOf = (acc) => {
+    const n = acc.tp + acc.sl + acc.timeout;
+    return n ? { n, exp: acc.sumR / n, win: (100 * acc.tp) / n } : null;
+  };
+  const inS = SPLIT_COMBOS
+    .map((c) => ({ key: c.key, s: expOf(backtest.split.inSample[c.key]) }))
+    .filter((x) => x.s && x.s.n >= 15);
+  if (!inS.length) return null;
+  const pick = inS.reduce((a, b) => (b.s.exp > a.s.exp ? b : a));
+  const after = expOf(backtest.split.outSample[pick.key]);
+  return { pick, after, heldUp: !!(after && after.exp > 0) };
+}
+
 function variantSummary(key) {
   const a = backtest.variants[key];
   const closed = a.tp + a.sl + a.timeout;
@@ -660,18 +677,10 @@ function reportBacktest() {
       `${active.expectancy >= 0 ? '+' : ''}${active.expectancy.toFixed(2)}R). ` +
       `Set SL ATR MULT=${best.key.split('/')[0]} and TP ATR MULT=${best.key.split('/')[1]} in Render to switch.`;
 
-  // The honest test: choose on the first half, judge on the second.
-  const expOf = (acc) => {
-    const n = acc.tp + acc.sl + acc.timeout;
-    return n ? { n, exp: acc.sumR / n, win: (100 * acc.tp) / n } : null;
-  };
-  const inS = SPLIT_COMBOS.map((c) => ({ key: c.key, s: expOf(backtest.split.inSample[c.key]) }))
-    .filter((x) => x.s && x.s.n >= 15);
+  const oos = outOfSampleResult();
   let oosBlock = '';
-  if (inS.length) {
-    const pick = inS.reduce((a, b) => (b.s.exp > a.s.exp ? b : a));
-    const after = expOf(backtest.split.outSample[pick.key]);
-    const heldUp = after && after.exp > 0;
+  if (oos) {
+    const { pick, after, heldUp } = oos;
     oosBlock = '\n\nOut-of-sample check (chosen on the first half, judged on the second):\n' +
       `Best on first half: ${pick.key} — ${pick.s.exp >= 0 ? '+' : ''}${pick.s.exp.toFixed(2)}R ` +
       `over ${pick.s.n} trades\n` +
@@ -1514,6 +1523,18 @@ if (process.env.PORT) {
         tp: backtest.tp, sl: backtest.sl, timeout: backtest.timeout,
       },
       liveOutcomes: { tp: outcomes.tp, sl: outcomes.sl, timeout: outcomes.timeout },
+      outOfSample: (() => {
+        const o = outOfSampleResult();
+        if (!o) return null;
+        return {
+          chosenOnFirstHalf: o.pick.key,
+          firstHalf: { trades: o.pick.s.n, expectancyR: +o.pick.s.exp.toFixed(3), winPct: +o.pick.s.win.toFixed(1) },
+          secondHalf: o.after
+            ? { trades: o.after.n, expectancyR: +o.after.exp.toFixed(3), winPct: +o.after.win.toFixed(1) }
+            : null,
+          heldUp: o.heldUp,
+        };
+      })(),
       today: {
         date: daily.day, entries: daily.entries, tp: daily.tp, sl: daily.sl,
         timeout: daily.timeout, netR: +daily.r.toFixed(2),
