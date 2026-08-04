@@ -1182,7 +1182,12 @@ function evaluateSignal(code, label) {
         : '') +
       '\n' +
       `*Confidence ${confidence}%*\n` +
-      `RSI(14) ${rsiVal.toFixed(1)} · ATR(14) ${atrVal.toFixed(d)}`,
+      `RSI(14) ${rsiVal.toFixed(1)} · ATR(14) ${atrVal.toFixed(d)}\n` +
+      // Printed so the numbers can be checked against an M15 chart directly,
+      // rather than judged by eye from where two lines appear to sit.
+      `EMA20 ${ema20Series.at(-1).toFixed(d)} · EMA50 ${ema50Series.at(-1).toFixed(d)} ` +
+      `(${ema20Series.at(-1) > ema50Series.at(-1) ? 'EMA20 above' : 'EMA20 below'})\n` +
+      `Check on M15, EMA 20 and 50 on Close`,
       { markdown: true }
     );
 
