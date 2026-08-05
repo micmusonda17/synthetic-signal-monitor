@@ -101,7 +101,10 @@ const MIN_HOLD_SAMPLES = Number(process.env.MIN_HOLD_SAMPLES || 20);
 // How much real history to pull per symbol on startup. Deriv caps ticks_history
 // at 5000 candles; 2000 M15 candles is about three weeks per instrument, which
 // is enough to calibrate against without slowing the boot noticeably.
-const HISTORY_BARS = Math.min(5000, Number(process.env.HISTORY_BARS || 2000));
+// Raised to the Deriv maximum so the entry scan can reach longer horizons: a
+// 32-candle hold needs roughly 4000 candles before the non-overlapping sample is
+// large enough to mean anything.
+const HISTORY_BARS = Math.min(5000, Number(process.env.HISTORY_BARS || 5000));
 
 // ---- Boom/Crash spike analysis ----
 // Boom drifts down and spikes up; Crash drifts up and spikes down, on average
@@ -439,8 +442,11 @@ const RISK_VARIANTS = [
 const variantKey = (v) => `${v.sl}/${v.tp}`;
 const ACTIVE_VARIANT = variantKey({ sl: SL_ATR_MULT, tp: TP_ATR_MULT });
 
+// sumR2 is the running sum of squared results, kept so the spread of outcomes
+// can be recovered later. Without it there is no way to tell a real difference
+// between two groups from a lucky one.
 function blankVariant() {
-  return { signals: 0, tp: 0, sl: 0, timeout: 0, sumR: 0, bars: [] };
+  return { signals: 0, tp: 0, sl: 0, timeout: 0, sumR: 0, sumR2: 0, bars: [] };
 }
 
 // Does letting the stop move actually help? With a 27% win rate the intuition is
@@ -465,8 +471,33 @@ const SPLIT_COMBOS = (() => {
   return out;
 })();
 
+// Does the confidence score mean anything? The bot has been publishing numbers
+// between the threshold and 95 without anyone ever checking whether a high one
+// outperforms a low one. If it does, raising the threshold is free improvement.
+// If it does not, the entire scoring apparatus is decoration and should be
+// replaced or removed rather than tuned.
+// The time stop was set at 24 candles when the median trade took 5. With tighter
+// levels the median is nearer 3, so six hours may now be holding dead trades ten
+// times longer than a typical winner needs. Measured rather than guessed.
+const TIME_STOP_VARIANTS = [6, 12, 24, 48];
+
+// Does it pay to trade only when the market is speeding up? Direction is not
+// predictable, but ATR-based targets need movement to reach them, so entering
+// into expanding volatility is a separate hypothesis that has never been tested.
+const VOL_BUCKETS = ['volatility rising', 'volatility falling'];
+
+const CONFIDENCE_BUCKETS = [
+  { key: '74-77', lo: 0, hi: 78 },
+  { key: '78-81', lo: 78, hi: 82 },
+  { key: '82-85', lo: 82, hi: 86 },
+  { key: '86+', lo: 86, hi: 999 },
+];
+
 const backtest = {
   done: 0, days: 0, reported: false,
+  byConfidence: Object.fromEntries(CONFIDENCE_BUCKETS.map((b) => [b.key, blankVariant()])),
+  byVolatility: Object.fromEntries(VOL_BUCKETS.map((k) => [k, blankVariant()])),
+  byTimeStop: Object.fromEntries(TIME_STOP_VARIANTS.map((t) => [`${t} candles`, blankVariant()])),
   split: {
     inSample: Object.fromEntries(SPLIT_COMBOS.map((c) => [c.key, blankVariant()])),
     outSample: Object.fromEntries(SPLIT_COMBOS.map((c) => [c.key, blankVariant()])),
@@ -518,7 +549,8 @@ function backtestSymbol(code, label, candles) {
   // One replay engine, driven by a risk setting and a management mode, so the
   // stop/target sweep and the break-even sweep cannot disagree with each other
   // or with the live monitor.
-  const replay = (slMult, tpMult, mgmt, acc, from = 60, to = candles.length) => {
+  const replay = (slMult, tpMult, mgmt, acc, from = 60, to = candles.length,
+                  timeStop = TIME_STOP_BARS) => {
     let lastConf = 0, lastDir = null, lastAlertBar = -1e9, open = null;
 
     for (let i = from; i < to; i++) {
@@ -534,7 +566,7 @@ function backtestSymbol(code, label, candles) {
         // know which traded first, and assuming the loss is the honest default.
         if (hitSl) out = 'SL';
         else if (hitTp) out = 'TP';
-        else if (held >= TIME_STOP_BARS) out = 'TIME';
+        else if (held >= timeStop) out = 'TIME';
 
         if (out) {
           // Measure the realised result rather than assuming a full win or loss:
@@ -546,6 +578,20 @@ function backtestSymbol(code, label, candles) {
           else acc.timeout++;
           acc.sumR += r;
           if (out !== 'TIME') acc.bars.push(held);
+          // Only the configured settings feed the confidence study, so it
+          // describes the trades you actually receive.
+          if (acc === backtest.active && open.confidence != null) {
+            const bucket = CONFIDENCE_BUCKETS.find(
+              (bk) => open.confidence >= bk.lo && open.confidence < bk.hi);
+            const record = (store) => {
+              store.signals++; store.sumR += r; store.sumR2 += r * r;
+              if (out === 'TP') store.tp++; else if (out === 'SL') store.sl++; else store.timeout++;
+            };
+            if (bucket) record(backtest.byConfidence[bucket.key]);
+            if (open.volRising != null) {
+              record(backtest.byVolatility[open.volRising ? VOL_BUCKETS[0] : VOL_BUCKETS[1]]);
+            }
+          }
           open = null;
           lastAlertBar = i;
         } else if (mgmt) {
@@ -565,8 +611,11 @@ function backtestSymbol(code, label, candles) {
         const long = sc.direction === 'BUY';
         const risk = slMult * sc.atrVal;
         const reward = tpMult * sc.atrVal;
+        // Was the market speeding up or slowing down as this trade opened?
+        const past = scores[i - 5];
         open = {
-          i, dir: sc.direction, entry: sc.price, risk,
+          i, dir: sc.direction, entry: sc.price, risk, confidence: sc.confidence,
+          volRising: past ? sc.atrVal > past.atrVal : null,
           sl: long ? sc.price - risk : sc.price + risk,
           tp: long ? sc.price + reward : sc.price - reward,
         };
@@ -582,6 +631,12 @@ function backtestSymbol(code, label, candles) {
   // Management sweep, held at the configured stop/target so the only thing
   // changing is whether the stop is allowed to move.
   for (const m of MGMT_VARIANTS) replay(SL_ATR_MULT, TP_ATR_MULT, m.cfg, backtest.mgmt[m.key]);
+  // Time-stop sweep at the configured levels, so the only thing changing is how
+  // long a trade is allowed to go nowhere.
+  for (const t of TIME_STOP_VARIANTS) {
+    replay(SL_ATR_MULT, TP_ATR_MULT, LIVE_MGMT.beAtR > 0 ? LIVE_MGMT : null,
+      backtest.byTimeStop[`${t} candles`], 60, candles.length, t);
+  }
 
   // Out-of-sample check. Picking the best of a dozen settings on one stretch of
   // history will always produce a flattering number - some of that result is the
@@ -670,6 +725,82 @@ function reportBacktest() {
         .join('\n')
     : '';
 
+  // Confidence study: does a higher score actually buy you a better trade?
+  // A bucket needs enough trades to say anything, and a difference between two
+  // buckets has to be larger than the noise in both of them combined. Without
+  // that second check this reported "higher scores work" on data generated with
+  // no edge at all, from a 37-trade bucket.
+  const conf = CONFIDENCE_BUCKETS.map((bk) => {
+    const a = backtest.byConfidence[bk.key];
+    const n = a.tp + a.sl + a.timeout;
+    if (n < 40) return null;
+    const exp = a.sumR / n;
+    const variance = Math.max(0, a.sumR2 / n - exp * exp);
+    return { key: bk.key, n, exp, win: (100 * a.tp) / n, se: Math.sqrt(variance / n) };
+  }).filter(Boolean);
+
+  let confBlock = '';
+  if (conf.length >= 2) {
+    const lowest = conf[0], highest = conf[conf.length - 1];
+    const diff = highest.exp - lowest.exp;
+    const seDiff = Math.sqrt(lowest.se ** 2 + highest.se ** 2);
+    const t = seDiff > 0 ? diff / seDiff : 0;
+    const predictive = t > 2;
+    confBlock = '\n\nDoes the confidence score predict anything?\n' +
+      conf.map((c) => `${c.key}: ${c.n} trades, win ${c.win.toFixed(0)}%, ` +
+        `${c.exp >= 0 ? '+' : ''}${c.exp.toFixed(2)}R`).join('\n') +
+      `\nTop versus bottom: ${diff >= 0 ? '+' : ''}${diff.toFixed(2)}R difference, ` +
+      `t ${t.toFixed(1)} (2.0 needed)\n` +
+      (predictive
+        ? 'Higher scores do produce better trades. Raising the threshold should help.'
+        : 'The difference is within the noise. The score separates a signal from no ' +
+          'signal, but beyond that the number carries no information - so raising the ' +
+          'threshold only reduces how many trades you get, without improving them.');
+  }
+
+  // Same discipline for the two new questions: report the numbers, and only
+  // claim a difference when it clears the noise in both groups combined.
+  const summarise = (store, key) => {
+    const a = store[key];
+    const n = a.tp + a.sl + a.timeout;
+    if (n < 40) return null;
+    const exp = a.sumR / n;
+    const variance = Math.max(0, a.sumR2 / n - exp * exp);
+    return { key, n, exp, win: (100 * a.tp) / n, se: Math.sqrt(variance / n) };
+  };
+  const compare = (a, b) => {
+    const se = Math.sqrt(a.se ** 2 + b.se ** 2);
+    return se > 0 ? (b.exp - a.exp) / se : 0;
+  };
+
+  const vol = VOL_BUCKETS.map((k) => summarise(backtest.byVolatility, k)).filter(Boolean);
+  let volBlock = '';
+  if (vol.length === 2) {
+    const t = compare(vol[1], vol[0]);
+    volBlock = '\n\nDoes it pay to trade only when volatility is rising?\n' +
+      vol.map((v) => `${v.key}: ${v.n} trades, win ${v.win.toFixed(0)}%, ` +
+        `${v.exp >= 0 ? '+' : ''}${v.exp.toFixed(2)}R`).join('\n') +
+      `\nDifference t ${t.toFixed(1)} (2.0 needed) - ` +
+      (Math.abs(t) > 2
+        ? (t > 0 ? 'rising volatility is genuinely better, worth filtering on.'
+                 : 'falling volatility is genuinely better, which is the opposite of the usual advice.')
+        : 'within the noise, so filtering on it would not help.');
+  }
+
+  const ts = TIME_STOP_VARIANTS.map((t) => summarise(backtest.byTimeStop, `${t} candles`)).filter(Boolean);
+  let tsBlock = '';
+  if (ts.length >= 2) {
+    const bestTs = ts.reduce((a, b) => (b.exp > a.exp ? b : a));
+    const current = ts.find((x) => x.key === `${TIME_STOP_BARS} candles`);
+    tsBlock = '\n\nHow long should a stale trade be given?\n' +
+      ts.map((x) => `${x.key} (${humanDuration(parseInt(x.key, 10))}): ${x.n} trades, ` +
+        `${x.exp >= 0 ? '+' : ''}${x.exp.toFixed(2)}R` +
+        (x.key === `${TIME_STOP_BARS} candles` ? ' (current)' : '')).join('\n') +
+      (current && bestTs.key !== current.key && compare(current, bestTs) > 2
+        ? `\nBest is ${bestTs.key}. Set TIME STOP BARS=${parseInt(bestTs.key, 10)} to switch.`
+        : '\nNo option is clearly better than the current one.');
+  }
+
   const advice = best.key === ACTIVE_VARIANT
     ? 'Your current levels came out best of those tested.'
     : `Better on this data: SL ${best.key.split('/')[0]}x TP ${best.key.split('/')[1]}x ` +
@@ -702,7 +833,7 @@ function reportBacktest() {
     `${active.expectancy >= 0 ? '+' : ''}${active.expectancy.toFixed(2)}R per trade\n` +
     `Typical hold ${humanDuration(active.hold.median)} ` +
     `(${humanDuration(active.hold.p25)} to ${humanDuration(active.hold.p75)})\n\n` +
-    `Stop and target comparison:\n${rows}\n\n${mgmtRows}${oosBlock}\n\n${advice}`
+    `Stop and target comparison:\n${rows}\n\n${mgmtRows}${confBlock}${volBlock}${tsBlock}${oosBlock}\n\n${advice}`
   );
 
   console.log(`[BACKTEST] active ${ACTIVE_VARIANT}: ${active.perDay.toFixed(2)}/day, ` +
@@ -785,9 +916,14 @@ function structureScan(label, candles) {
   for (let i = 1; i < closes.length; i++) r.push(closes[i] - closes[i - 1]);
   const scale = sdOf(r) || 1;
 
+  // 1 to 12 candles covers up to three hours. The longer values extend the reach
+  // to eight hours, which is as far as the data honestly allows: forward windows
+  // must not overlap, so a 32-candle hold needs 32 x 120 candles to produce a
+  // usable sample, and Deriv caps history at 5000 per request.
+  const SPANS = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 16, 20, 24, 32];
   const grid = [];
-  for (let L = 1; L <= 12; L++) {
-    for (let H = 1; H <= 12; H++) {
+  for (const L of SPANS) {
+    for (const H of SPANS) {
       const payoffs = [];
       for (let i = L; i + H <= r.length; i += H) {
         const past = r.slice(i - L, i).reduce((a, b) => a + b, 0);
@@ -1523,6 +1659,12 @@ if (process.env.PORT) {
         tp: backtest.tp, sl: backtest.sl, timeout: backtest.timeout,
       },
       liveOutcomes: { tp: outcomes.tp, sl: outcomes.sl, timeout: outcomes.timeout },
+      byConfidence: Object.fromEntries(CONFIDENCE_BUCKETS.map((bk) => {
+        const a = backtest.byConfidence[bk.key];
+        const n = a.tp + a.sl + a.timeout;
+        return [bk.key, n ? { trades: n, winPct: +((100 * a.tp) / n).toFixed(1),
+          expectancyR: +(a.sumR / n).toFixed(3) } : null];
+      })),
       outOfSample: (() => {
         const o = outOfSampleResult();
         if (!o) return null;
