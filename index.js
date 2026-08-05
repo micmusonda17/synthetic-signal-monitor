@@ -1659,12 +1659,20 @@ if (process.env.PORT) {
         tp: backtest.tp, sl: backtest.sl, timeout: backtest.timeout,
       },
       liveOutcomes: { tp: outcomes.tp, sl: outcomes.sl, timeout: outcomes.timeout },
-      byConfidence: Object.fromEntries(CONFIDENCE_BUCKETS.map((bk) => {
-        const a = backtest.byConfidence[bk.key];
-        const n = a.tp + a.sl + a.timeout;
-        return [bk.key, n ? { trades: n, winPct: +((100 * a.tp) / n).toFixed(1),
-          expectancyR: +(a.sumR / n).toFixed(3) } : null];
-      })),
+      // Every study reachable from one place, so a question never has to be
+      // chased through chat history again.
+      ...(() => {
+        const digest = (store) => Object.fromEntries(Object.entries(store).map(([k, a]) => {
+          const n = a.tp + a.sl + a.timeout;
+          return [k, n ? { trades: n, winPct: +((100 * a.tp) / n).toFixed(1),
+            expectancyR: +(a.sumR / n).toFixed(3) } : null];
+        }));
+        return {
+          byConfidence: digest(backtest.byConfidence),
+          byVolatility: digest(backtest.byVolatility),
+          byTimeStop: digest(backtest.byTimeStop),
+        };
+      })(),
       outOfSample: (() => {
         const o = outOfSampleResult();
         if (!o) return null;
