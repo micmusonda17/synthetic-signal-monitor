@@ -87,6 +87,19 @@ const BREAKEVEN_AT_R = Number(process.env.BREAKEVEN_AT_R ?? 0);
 const TRAIL_AFTER_R = Number(process.env.TRAIL_AFTER_R ?? 0);
 const TRAIL_DISTANCE_R = Number(process.env.TRAIL_DISTANCE_R || 1);
 
+// ---- Trading costs ----
+// Every result so far has assumed you get the exact quoted price. You do not:
+// there is a spread on entry, and it is a fixed cost per trade. Expressed as a
+// fraction of ATR so it scales across instruments the way everything else does.
+//
+// The consequence people miss: cost in R is SPREAD_ATR divided by the stop
+// multiple. Halving the stop from 1.5 to 1.0 ATR made the same spread 50% more
+// expensive per trade, so the setting that wins on gross numbers is not
+// automatically the one that wins after costs. Applied inside the replay so the
+// stop/target comparison ranks on net results, not gross.
+const SPREAD_ATR = Number(process.env.SPREAD_ATR || 0);
+const SPREAD_LEVELS = [0, 0.02, 0.05, 0.1, 0.2];
+
 // A trade that has gone nowhere is not a trade, it is exposure. After this many
 // candles the monitor stops waiting and tells you to close it. 24 M15 candles
 // is 6 hours, which in simulation covers about 90% of trades that resolve.
@@ -582,7 +595,10 @@ function backtestSymbol(code, label, candles) {
           // Measure the realised result rather than assuming a full win or loss:
           // once the stop can move, "stop hit" no longer means exactly -1R.
           const exit = out === 'SL' ? open.sl : out === 'TP' ? open.tp : bar.close;
-          const r = (long ? exit - open.entry : open.entry - exit) / open.risk;
+          // Risk is slMult x ATR and the spread is SPREAD_ATR x ATR, so the cost
+          // in R is simply the ratio of the two - the ATR cancels.
+          const costR = slMult > 0 ? SPREAD_ATR / slMult : 0;
+          const r = (long ? exit - open.entry : open.entry - exit) / open.risk - costR;
           if (out === 'TP') acc.tp++;
           else if (out === 'SL') acc.sl++;
           else acc.timeout++;
@@ -811,6 +827,21 @@ function reportBacktest() {
         : '\nNo option is clearly better than the current one.');
   }
 
+  // Cost sensitivity. The per-trade cost is a constant, so the whole curve can
+  // be read off the gross figure without replaying anything.
+  const costPerR = 1 / SL_ATR_MULT;
+  const gross = active.expectancy + SPREAD_ATR * costPerR;
+  const costBlock = '\n\nWhat the spread does to this\n' +
+    SPREAD_LEVELS.map((f) => {
+      const net = gross - f * costPerR;
+      return `spread ${f === 0 ? 'ignored' : `${f} x ATR`}: ` +
+        `${net >= 0 ? '+' : ''}${net.toFixed(2)}R` +
+        (Math.abs(f - SPREAD_ATR) < 1e-9 ? '  (assumed)' : '');
+    }).join('\n') +
+    `\nYour stop is ${SL_ATR_MULT}x ATR, so every 0.01 ATR of spread costs ` +
+    `${(0.01 * costPerR).toFixed(3)}R per trade. Check the spread on your platform ` +
+    `and read off the matching row - that is your real expectancy.`;
+
   const advice = best.key === ACTIVE_VARIANT
     ? 'Your current levels came out best of those tested.'
     : `Better on this data: SL ${best.key.split('/')[0]}x TP ${best.key.split('/')[1]}x ` +
@@ -843,7 +874,7 @@ function reportBacktest() {
     `${active.expectancy >= 0 ? '+' : ''}${active.expectancy.toFixed(2)}R per trade\n` +
     `Typical hold ${humanDuration(active.hold.median)} ` +
     `(${humanDuration(active.hold.p25)} to ${humanDuration(active.hold.p75)})\n\n` +
-    `Stop and target comparison:\n${rows}\n\n${mgmtRows}${confBlock}${volBlock}${tsBlock}${oosBlock}\n\n${advice}`
+    `Stop and target comparison:\n${rows}\n\n${mgmtRows}${costBlock}${confBlock}${volBlock}${tsBlock}${oosBlock}\n\n${advice}`
   );
 
   console.log(`[BACKTEST] active ${ACTIVE_VARIANT}: ${active.perDay.toFixed(2)}/day, ` +
@@ -1738,6 +1769,11 @@ if (process.env.PORT) {
       threshold: CONFIDENCE_THRESHOLD,
       perSymbolThresholds: SYMBOL_THRESHOLDS,
       risk: { slAtrMult: SL_ATR_MULT, tpAtrMult: TP_ATR_MULT, rr: rrLabel, timeStopBars: TIME_STOP_BARS },
+      costs: {
+        spreadAtrAssumed: SPREAD_ATR,
+        costPerTradeR: +(SPREAD_ATR / SL_ATR_MULT).toFixed(4),
+        rCostPer001Atr: +(0.01 / SL_ATR_MULT).toFixed(4),
+      },
       hold: holdGuidance(),
       backtest: {
         days: Math.round(backtest.days),
