@@ -117,7 +117,17 @@ const MIN_HOLD_SAMPLES = Number(process.env.MIN_HOLD_SAMPLES || 20);
 // Raised to the Deriv maximum so the entry scan can reach longer horizons: a
 // 32-candle hold needs roughly 4000 candles before the non-overlapping sample is
 // large enough to mean anything.
-const HISTORY_BARS = Math.min(5000, Number(process.env.HISTORY_BARS || 5000));
+// Deriv silently caps candle history at 1000 per request no matter what you ask
+// for - the same undocumented limit that applies to ticks. Asking for 5000 and
+// receiving 1000 is why every backtest reported exactly 10.4 days and why the
+// sample never grew past about 100 trades however often it re-ran.
+// Walking backwards through history the way the spike analysis does turns that
+// into roughly 200 days and 2000 trades, which is the difference between a
+// suggestive result and a settled one.
+const HISTORY_BARS = 1000;
+const HISTORY_BATCHES = Number(process.env.HISTORY_BATCHES || 20);
+const HISTORY_REQUEST_MS = Number(process.env.HISTORY_REQUEST_MS || 1500);
+const HISTORY_MAX_RETRIES = Number(process.env.HISTORY_MAX_RETRIES || 6);
 
 // ---- Boom/Crash spike analysis ----
 // Boom drifts down and spikes up; Crash drifts up and spikes down, on average
@@ -1221,6 +1231,13 @@ function onSpikeError(code, errorCode) {
 }
 
 function startSpikeLab(list) {
+  // Set SPIKE_BATCHES to 0 once the spike question is settled. It costs several
+  // hundred requests per restart, and running it alongside candle pagination is
+  // what makes the two collectively trip Deriv's rate limiter.
+  if (SPIKE_BATCHES < 1) {
+    console.log('[SPIKE] disabled (SPIKE_BATCHES=0)');
+    return;
+  }
   for (const s of list) {
     const meta = SPIKE_META[s.label];
     if (!meta) continue;
@@ -1603,19 +1620,97 @@ function startOtherMarketScan(available) {
   }
   scanStats.expected += others.length;
 
-  // Spaced out because a burst of history requests is what tripped Deriv's rate
-  // limiter during the spike work.
-  others.forEach((s, i) => {
-    setTimeout(() => {
-      ws.send(JSON.stringify({
-        ticks_history: s.underlying_symbol, style: 'candles',
-        granularity: GRANULARITY, count: HISTORY_BARS, end: 'latest',
-      }));
-    }, (i + 1) * SCAN_REQUEST_MS);
-  });
+  // Through the same throttled queue as the pagination, so the two cannot
+  // collectively trip the rate limiter.
+  for (const s of others) enqueueHistory({ code: s.underlying_symbol });
 
   console.log(`[SCAN] also analysing ${others.length} non-synthetic instruments: ` +
     others.map((s) => s.underlying_symbol).join(', '));
+}
+
+// ---- Candle history collection ----
+// One throttled queue for every extra history request, so pagination and the
+// other-market scan cannot collectively trip Deriv's rate limiter. Mirrors the
+// spike collector: fixed pacing, widening automatically if Deriv objects.
+const histLab = {
+  symbols: {}, queue: [], timer: null, inFlight: null,
+  intervalMs: HISTORY_REQUEST_MS, rateLimitHits: 0,
+};
+
+function enqueueHistory(job) {
+  histLab.queue.push({ attempt: 0, ...job });
+  pumpHistoryQueue();
+}
+
+function pumpHistoryQueue() {
+  if (histLab.timer) return;
+  histLab.timer = setInterval(() => {
+    const job = histLab.queue.shift();
+    if (!job) { clearInterval(histLab.timer); histLab.timer = null; return; }
+    histLab.inFlight = job;
+    ws.send(JSON.stringify({
+      ticks_history: job.code, style: 'candles', granularity: GRANULARITY,
+      count: HISTORY_BARS, end: job.end || 'latest',
+    }));
+  }, histLab.intervalMs);
+}
+
+function onHistoryError(code, errorCode) {
+  const job = histLab.inFlight;
+  const attempt = (job && job.code === code ? job.attempt : 0) + 1;
+  const st = histLab.symbols[code];
+
+  if (errorCode === 'RateLimit' && attempt <= HISTORY_MAX_RETRIES) {
+    histLab.rateLimitHits += 1;
+    histLab.intervalMs = Math.min(15000, Math.round(histLab.intervalMs * 1.8));
+    if (histLab.timer) { clearInterval(histLab.timer); histLab.timer = null; }
+    pumpHistoryQueue();
+    console.log(`[HIST] rate limited, slowing to ${histLab.intervalMs}ms ` +
+      `(attempt ${attempt}/${HISTORY_MAX_RETRIES})`);
+    enqueueHistory({ ...job, attempt });
+    return;
+  }
+  console.error(`[HIST] giving up on ${code} (${errorCode})`);
+  if (st && !st.done) finishHistory(code);
+}
+
+// Called with the first, subscribed batch. Everything after this is pagination.
+function beginHistory(code, label, candles) {
+  histLab.symbols[code] = {
+    label, buffer: candles.slice(), batches: 1, oldest: candles[0]?.time ?? null, done: false,
+  };
+  enqueueHistory({ code, end: (candles[0]?.time ?? 0) - 1 });
+}
+
+function onHistoryPage(code, candles) {
+  const st = histLab.symbols[code];
+  if (!st || st.done) return;
+  const newOldest = candles[0]?.time ?? null;
+  const movedBack = newOldest !== null && (st.oldest === null || newOldest < st.oldest);
+  if (candles.length) st.buffer = candles.concat(st.buffer);
+  st.batches += 1;
+  st.oldest = newOldest ?? st.oldest;
+
+  if (st.batches < HISTORY_BATCHES && candles.length >= 100 && movedBack) {
+    enqueueHistory({ code, end: newOldest - 1 });
+    return;
+  }
+  finishHistory(code);
+}
+
+function finishHistory(code) {
+  const st = histLab.symbols[code];
+  if (!st || st.done) return;
+  st.done = true;
+  const days = st.buffer.length
+    ? (st.buffer.at(-1).time - st.buffer[0].time) / 86400 : 0;
+  console.log(`[HIST] ${st.label}: ${st.buffer.length} candles over ${days.toFixed(1)} days ` +
+    `(${st.batches} requests)`);
+  backtestSymbol(code, st.label, st.buffer);
+  structureScan(st.label, st.buffer, 'synthetic');
+  st.buffer = [];
+  reportBacktest();
+  reportStructureScan();
 }
 
 function connect() {
@@ -1641,6 +1736,12 @@ function connect() {
       // retired, otherwise that symbol stays pending and the report never fires.
       if (reqCode && spikeLab.symbols[reqCode] && data.echo_req?.style === 'ticks') {
         onSpikeError(reqCode, data.error.code);
+        return;
+      }
+      // A failed history page must be retried or retired, or that symbol never
+      // finishes and the backtest never fires.
+      if (reqCode && data.echo_req?.style === 'candles' && histLab.symbols[reqCode]) {
+        onHistoryError(reqCode, data.error.code);
         return;
       }
       console.error('Deriv error:', data.error.code, data.error.message,
@@ -1706,16 +1807,20 @@ function connect() {
       const full = data.candles.map((c) => ({
         time: c.epoch, open: +c.open, high: +c.high, low: +c.low, close: +c.close,
       }));
-      // Deriv hands us thousands of real candles on the first response. Replaying
-      // the strategy over them costs nothing and produces calibration figures
-      // from this instrument's actual behaviour, which beats any assumption
-      // about what a synthetic index does.
-      backtestSymbol(reqSymbol, labels[reqSymbol] || reqSymbol, full);
-      structureScan(labels[reqSymbol] || reqSymbol, full);
-      reportBacktest();
-      reportStructureScan();
-      st.candles = full.slice(-150);
-      evaluateSignal(reqSymbol, labels[reqSymbol] || reqSymbol);
+      // The subscribed response carries only the most recent 1000 candles, which
+      // is ten days. The backtest waits until pagination has walked back through
+      // several months, because a hundred trades cannot settle anything.
+      //
+      // Only the subscribed batch may touch the live candle window. Paginated
+      // pages are older data, and letting them overwrite it would rewind the
+      // monitor to last month and fire signals from stale prices.
+      if (data.echo_req?.subscribe === 1) {
+        st.candles = full.slice(-150);
+        beginHistory(reqSymbol, labels[reqSymbol] || reqSymbol, full);
+        evaluateSignal(reqSymbol, labels[reqSymbol] || reqSymbol);
+      } else {
+        onHistoryPage(reqSymbol, full);
+      }
     }
     if (data.msg_type === 'ohlc' && data.ohlc) {
       const symCode = data.ohlc.symbol;
