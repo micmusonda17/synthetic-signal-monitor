@@ -526,11 +526,70 @@ const CONFIDENCE_BUCKETS = [
   { key: '86+', lo: 86, hi: 999 },
 ];
 
+// The confidence buckets say a high score pays better than a low one, but that
+// is an in-sample observation on buckets chosen after seeing the data. Raising
+// the threshold is only justified if the ranking survives on history the choice
+// was not made on, so every candidate threshold is replayed on both halves and
+// picked on the first one alone.
+//
+// Two numbers matter and they pull in opposite directions: expectancy per trade
+// rises with the threshold, while trades per day falls. Which one to optimise
+// depends on whether the account is capacity-constrained. With MAX_OPEN_TRADES
+// capping concurrent positions, most filtered-out signals were never tradeable
+// anyway, so per-trade quality is the honest target - but R per day is reported
+// alongside it so the trade-off is visible rather than assumed.
+// These are BASE thresholds, meaning the value CONFIDENCE_THRESHOLD would be set
+// to. Boom and Crash carry a bump on top, and the sweep preserves each symbol's
+// own offset - otherwise "78" would quietly remove the Boom/Crash filter while
+// tightening everything else, and the winning row would not correspond to any
+// setting that could actually be applied.
+const THRESHOLD_VARIANTS = (() => {
+  const set = new Set([72, 74, 76, 78, 80, 82, 84]);
+  set.add(CONFIDENCE_THRESHOLD); // always measure what is actually running
+  return [...set].sort((a, b) => a - b);
+})();
+
+// Would a slower chart suit a small account better? Holding fewer, longer trades
+// is not obviously better or worse - it trades signal count for signal quality,
+// and the only way to know which wins is to measure both. M15 candles are
+// aggregated into H1 and H4 here rather than pulled separately, so all three
+// timeframes are scored on exactly the same price history.
+const TIMEFRAME_VARIANTS = [
+  { key: 'M15 (live)', group: 1 },
+  { key: 'H1', group: 4 },
+  { key: 'H4', group: 16 },
+];
+
+// Merges consecutive candles into one. Open comes from the first, close from the
+// last, high and low from the extremes - the standard aggregation, and the same
+// one MT5 would show if the chart period were changed.
+function aggregateCandles(candles, group) {
+  if (group <= 1) return candles;
+  const out = [];
+  for (let i = 0; i + group <= candles.length; i += group) {
+    const slice = candles.slice(i, i + group);
+    out.push({
+      time: slice[0].time,
+      open: slice[0].open,
+      close: slice.at(-1).close,
+      high: Math.max(...slice.map((c) => c.high)),
+      low: Math.min(...slice.map((c) => c.low)),
+    });
+  }
+  return out;
+}
+
 const backtest = {
   done: 0, days: 0, reported: false,
   byConfidence: Object.fromEntries(CONFIDENCE_BUCKETS.map((b) => [b.key, blankVariant()])),
   byVolatility: Object.fromEntries(VOL_BUCKETS.map((k) => [k, blankVariant()])),
   byTimeStop: Object.fromEntries(TIME_STOP_VARIANTS.map((t) => [`${t} candles`, blankVariant()])),
+  byThreshold: Object.fromEntries(THRESHOLD_VARIANTS.map((t) => [String(t), blankVariant()])),
+  byTimeframe: Object.fromEntries(TIMEFRAME_VARIANTS.map((t) => [t.key, blankVariant()])),
+  thresholdSplit: {
+    inSample: Object.fromEntries(THRESHOLD_VARIANTS.map((t) => [String(t), blankVariant()])),
+    outSample: Object.fromEntries(THRESHOLD_VARIANTS.map((t) => [String(t), blankVariant()])),
+  },
   split: {
     inSample: Object.fromEntries(SPLIT_COMBOS.map((c) => [c.key, blankVariant()])),
     outSample: Object.fromEntries(SPLIT_COMBOS.map((c) => [c.key, blankVariant()])),
@@ -557,12 +616,11 @@ if (!backtest.variants[ACTIVE_VARIANT]) {
 // same threshold cross / flip trigger, same cooldown, same one-position rule,
 // same time stop. If this disagrees with live behaviour later, the rules here
 // have drifted from evaluateSignal and that is a bug, not a market change.
-function backtestSymbol(code, label, candles) {
-  if (candles.length < 200) return;
-  const cooldownBars = Math.max(1, Math.round(ALERT_COOLDOWN_MS / (GRANULARITY * 1000)));
-
-  // Scoring is by far the expensive part and does not depend on stop placement,
-  // so it runs once per bar and every risk variant reuses the result.
+// Scoring is by far the expensive part and does not depend on stop placement,
+// so it runs once per bar and every variant reuses the result. Pulled out of
+// backtestSymbol so the same code scores the aggregated H1 and H4 series - if
+// the timeframe study used its own copy the comparison would be meaningless.
+function scoreSeries(candles) {
   const scores = new Array(candles.length).fill(null);
   for (let i = 60; i < candles.length; i++) {
     const win = candles.slice(Math.max(0, i - 150), i);
@@ -578,12 +636,18 @@ function backtestSymbol(code, label, candles) {
     });
     scores[i] = { confidence, direction, atrVal, price };
   }
+  return scores;
+}
 
-  // One replay engine, driven by a risk setting and a management mode, so the
-  // stop/target sweep and the break-even sweep cannot disagree with each other
-  // or with the live monitor.
-  const replay = (slMult, tpMult, mgmt, acc, from = 60, to = candles.length,
-                  timeStop = TIME_STOP_BARS) => {
+// One replay engine, driven by a risk setting and a management mode, so the
+// stop/target sweep, the break-even sweep, the threshold sweep and the timeframe
+// study cannot disagree with each other or with the live monitor.
+// `studies` is false for anything that is not the live configuration, so the
+// confidence and volatility tables only ever describe trades you would actually
+// have received.
+function makeReplay(candles, scores, cooldownBars, defaultThreshold, studies) {
+  return (slMult, tpMult, mgmt, acc, from = 60, to = candles.length,
+          timeStop = TIME_STOP_BARS, threshold = defaultThreshold) => {
     let lastConf = 0, lastDir = null, lastAlertBar = -1e9, open = null;
 
     for (let i = from; i < to; i++) {
@@ -613,10 +677,13 @@ function backtestSymbol(code, label, candles) {
           else if (out === 'SL') acc.sl++;
           else acc.timeout++;
           acc.sumR += r;
+          // Squared results too, so the spread of outcomes can be recovered and
+          // any two accumulators compared properly instead of by eye.
+          acc.sumR2 += r * r;
           if (out !== 'TIME') acc.bars.push(held);
           // Only the configured settings feed the confidence study, so it
           // describes the trades you actually receive.
-          if (acc === backtest.active && open.confidence != null) {
+          if (studies && acc === backtest.active && open.confidence != null) {
             const bucket = CONFIDENCE_BUCKETS.find(
               (bk) => open.confidence >= bk.lo && open.confidence < bk.hi);
             const record = (store) => {
@@ -640,8 +707,8 @@ function backtestSymbol(code, label, candles) {
       if (!sc) continue;
       // Same per-symbol bar the live monitor uses, so the backtest keeps
       // reporting what you will actually receive.
-      const strong = sc.confidence >= thresholdFor(label);
-      const crossedUp = strong && lastConf < thresholdFor(label);
+      const strong = sc.confidence >= threshold;
+      const crossedUp = strong && lastConf < threshold;
       const flipped = strong && lastDir !== null && lastDir !== sc.direction;
       if ((crossedUp || flipped) && (i - lastAlertBar) > cooldownBars) {
         const long = sc.direction === 'BUY';
@@ -661,6 +728,18 @@ function backtestSymbol(code, label, candles) {
       lastDir = sc.direction;
     }
   };
+}
+
+// Replays exactly the live gating rules over historical candles: same score,
+// same threshold cross / flip trigger, same cooldown, same one-position rule,
+// same time stop. If this disagrees with live behaviour later, the rules here
+// have drifted from evaluateSignal and that is a bug, not a market change.
+function backtestSymbol(code, label, candles) {
+  if (candles.length < 200) return;
+  const cooldownBars = Math.max(1, Math.round(ALERT_COOLDOWN_MS / (GRANULARITY * 1000)));
+  const liveThreshold = thresholdFor(label);
+  const scores = scoreSeries(candles);
+  const replay = makeReplay(candles, scores, cooldownBars, liveThreshold, true);
 
   // Stop/target sweep, all with fixed stops so the comparison is clean.
   for (const v of RISK_VARIANTS) replay(v.sl, v.tp, null, backtest.variants[variantKey(v)]);
@@ -685,7 +764,53 @@ function backtestSymbol(code, label, candles) {
     replay(combo.sl, combo.tp, combo.cfg, backtest.split.outSample[combo.key], mid, candles.length);
   }
 
+  // Threshold sweep. Run on the full history for the headline table, and on each
+  // half separately so the choice can be made on data the verdict is not read
+  // from. Everything else is held at the live settings so the only thing moving
+  // is how selective the bot is.
+  const liveCfg = LIVE_MGMT.beAtR > 0 || LIVE_MGMT.trailAfterR > 0 ? LIVE_MGMT : null;
+  // Whatever extra selectivity this symbol already carries travels with it, so
+  // each row is a base threshold that could be set in Render as-is.
+  const symbolOffset = liveThreshold - CONFIDENCE_THRESHOLD;
+  for (const t of THRESHOLD_VARIANTS) {
+    const k = String(t);
+    const applied = t + symbolOffset;
+    replay(SL_ATR_MULT, TP_ATR_MULT, liveCfg, backtest.byThreshold[k],
+      60, candles.length, TIME_STOP_BARS, applied);
+    replay(SL_ATR_MULT, TP_ATR_MULT, liveCfg, backtest.thresholdSplit.inSample[k],
+      60, mid, TIME_STOP_BARS, applied);
+    replay(SL_ATR_MULT, TP_ATR_MULT, liveCfg, backtest.thresholdSplit.outSample[k],
+      mid, candles.length, TIME_STOP_BARS, applied);
+  }
+
   const spanDays = (candles.at(-1).time - candles[0].time) / 86400;
+
+  // Timeframe study. The same history, merged into bigger candles, scored by the
+  // same function and replayed by the same engine.
+  //
+  // The time stop stays at the same number of BARS rather than the same number
+  // of hours. Holding it at six hours across every timeframe was the obvious
+  // thing to do and it is wrong: stops and targets are ATR multiples, and ATR on
+  // H4 is roughly four times the M15 figure, so an H4 trade has sixteen times
+  // further to travel. Capping it at six hours would time nearly all of them out
+  // and report the slower charts as hopeless when what had actually been
+  // measured was the time stop. In bars, each timeframe is judged at its own
+  // natural pace - which is also the whole point of asking the question.
+  for (const tf of TIMEFRAME_VARIANTS) {
+    const merged = tf.group === 1 ? candles : aggregateCandles(candles, tf.group);
+    if (merged.length < 200) continue;
+    const tfScores = tf.group === 1 ? scores : scoreSeries(merged);
+    const tfCooldown = Math.max(1, Math.round(cooldownBars / tf.group));
+    const tfTimeStop = TIME_STOP_BARS;
+    const tfReplay = makeReplay(merged, tfScores, tfCooldown, liveThreshold, false);
+    const acc = backtest.byTimeframe[tf.key];
+    tfReplay(SL_ATR_MULT, TP_ATR_MULT, liveCfg, acc, 60, merged.length, tfTimeStop);
+    // Hold time is in bars, and a bar means something different on each
+    // timeframe, so record the span in days to make the study comparable.
+    acc.spanDays = (acc.spanDays || 0) + spanDays;
+    acc.barMinutes = (GRANULARITY / 60) * tf.group;
+  }
+
   backtest.done += 1;
   backtest.days = Math.max(backtest.days, spanDays);
   const a = backtest.active;
@@ -712,6 +837,85 @@ function outOfSampleResult() {
   const pick = inS.reduce((a, b) => (b.s.exp > a.s.exp ? b : a));
   const after = expOf(backtest.split.outSample[pick.key]);
   return { pick, after, heldUp: !!(after && after.exp > 0) };
+}
+
+// Same discipline applied to the threshold. The confidence table already says a
+// high score pays better, but that table was read off the same data that would
+// justify the change, and a bucket boundary picked after the fact is exactly how
+// a nonexistent edge gets adopted. So the threshold is chosen on the first half
+// of history and reported on the second.
+//
+// Two guards keep this from recommending a threshold nobody could trade:
+// a minimum trade count, and a report of what the choice costs in signals.
+function thresholdOutOfSample() {
+  const stat = (acc) => {
+    const n = acc.tp + acc.sl + acc.timeout;
+    if (!n) return null;
+    const exp = acc.sumR / n;
+    // Standard error of the mean R, so a difference can be judged rather than
+    // eyeballed. sumR2 is carried for exactly this.
+    const varR = Math.max(acc.sumR2 / n - exp * exp, 0);
+    return {
+      n, exp, win: (100 * acc.tp) / n,
+      se: n > 1 ? Math.sqrt(varR / n) : null,
+      t: n > 1 && varR > 0 ? exp / Math.sqrt(varR / n) : null,
+    };
+  };
+
+  const table = THRESHOLD_VARIANTS.map((t) => {
+    const full = stat(backtest.byThreshold[String(t)]);
+    return full ? {
+      threshold: t, ...full,
+      perDay: backtest.byThreshold[String(t)].signals / Math.max(backtest.days, 1),
+    } : null;
+  }).filter(Boolean);
+
+  const first = THRESHOLD_VARIANTS
+    .map((t) => ({ threshold: t, s: stat(backtest.thresholdSplit.inSample[String(t)]) }))
+    .filter((x) => x.s && x.s.n >= 100);
+  if (!first.length) return { table, pick: null };
+
+  const pick = first.reduce((a, b) => (b.s.exp > a.s.exp ? b : a));
+  const after = stat(backtest.thresholdSplit.outSample[String(pick.threshold)]);
+  const live = stat(backtest.thresholdSplit.outSample[String(CONFIDENCE_THRESHOLD)]);
+
+  // The question is not "is the chosen threshold profitable" - almost all of
+  // them are. It is "did choosing it beat leaving the setting alone", measured
+  // on data neither choice was made on.
+  let beatsLive = null;
+  if (after && live && after.se != null && live.se != null && pick.threshold !== CONFIDENCE_THRESHOLD) {
+    const diff = after.exp - live.exp;
+    const se = Math.sqrt(after.se ** 2 + live.se ** 2);
+    beatsLive = { diff, t: se > 0 ? diff / se : null };
+  }
+
+  return { table, pick, after, live, beatsLive };
+}
+
+// Does a slower chart suit a small account better? Compared on R per day rather
+// than R per trade, because a setting that returns twice as much per trade while
+// producing a tenth as many trades is a worse business, not a better one.
+function timeframeStudy() {
+  return TIMEFRAME_VARIANTS.map((tf) => {
+    const a = backtest.byTimeframe[tf.key];
+    const n = a.tp + a.sl + a.timeout;
+    if (!n || !a.spanDays) return null;
+    const days = a.spanDays / Math.max(activeSymbols.length, 1);
+    const exp = a.sumR / n;
+    const varR = Math.max(a.sumR2 / n - exp * exp, 0);
+    const meanBars = a.bars.length ? a.bars.reduce((x, y) => x + y, 0) / a.bars.length : null;
+    return {
+      timeframe: tf.key,
+      barMinutes: a.barMinutes,
+      trades: n,
+      winPct: +((100 * a.tp) / n).toFixed(1),
+      expectancyR: +exp.toFixed(3),
+      t: n > 1 && varR > 0 ? +(exp / Math.sqrt(varR / n)).toFixed(2) : null,
+      tradesPerDay: +(n / Math.max(days, 1)).toFixed(2),
+      rPerDay: +(a.sumR / Math.max(days, 1)).toFixed(3),
+      typicalHoldHours: meanBars != null ? +((meanBars * a.barMinutes) / 60).toFixed(1) : null,
+    };
+  }).filter(Boolean);
 }
 
 function variantSummary(key) {
@@ -876,6 +1080,54 @@ function reportBacktest() {
         : 'Not enough second-half trades to judge.');
   }
 
+  // The threshold is the one setting that trades quantity for quality directly,
+  // so it gets the full treatment: full-history table, a choice made on the first
+  // half only, and a test of whether that choice beats leaving it alone.
+  const th = thresholdOutOfSample();
+  let thBlock = '';
+  if (th.table.length) {
+    thBlock = '\n\nHow selective should the bot be?\n' +
+      th.table.map((x) => `${x.threshold}%: ${x.perDay.toFixed(1)}/day, ${x.n} trades, ` +
+        `win ${x.win.toFixed(0)}%, ${x.exp >= 0 ? '+' : ''}${x.exp.toFixed(2)}R` +
+        (x.threshold === CONFIDENCE_THRESHOLD ? '  (current)' : '')).join('\n');
+    if (th.pick && th.after) {
+      thBlock += `\nChosen on the first half: ${th.pick.threshold}%. ` +
+        `On the second half it never saw: ${th.after.exp >= 0 ? '+' : ''}${th.after.exp.toFixed(2)}R ` +
+        `over ${th.after.n} trades.`;
+      if (th.beatsLive) {
+        thBlock += `\nAgainst the current ${CONFIDENCE_THRESHOLD}% on that same second half: ` +
+          `${th.beatsLive.diff >= 0 ? '+' : ''}${th.beatsLive.diff.toFixed(2)}R difference, ` +
+          `t ${th.beatsLive.t == null ? 'n/a' : th.beatsLive.t.toFixed(1)} (2.0 needed).\n` +
+          (th.beatsLive.t != null && th.beatsLive.t > 2
+            ? `Worth changing. Set CONFIDENCE THRESHOLD=${th.pick.threshold} in Render.`
+            : 'Not proven. Leave the threshold where it is - fewer trades for an ' +
+              'unproven gain is a worse position, not a safer one.');
+      } else {
+        thBlock += '\nThe first half picked the setting already running, so there is ' +
+          'nothing to change.';
+      }
+    }
+  }
+
+  // Whether a slower chart suits the account better is a separate question from
+  // how selective to be, and answering it on R per day keeps a low-frequency
+  // setting from looking good purely because it trades rarely.
+  const tfs = timeframeStudy();
+  let tfBlock = '';
+  if (tfs.length >= 2) {
+    const bestTf = tfs.reduce((a, b) => (b.rPerDay > a.rPerDay ? b : a));
+    tfBlock = '\n\nWould a slower chart suit the account better?\n' +
+      tfs.map((x) => `${x.timeframe}: ${x.tradesPerDay.toFixed(1)} trades/day, ` +
+        `win ${x.winPct.toFixed(0)}%, ${x.expectancyR >= 0 ? '+' : ''}${x.expectancyR.toFixed(2)}R each, ` +
+        `${x.rPerDay >= 0 ? '+' : ''}${x.rPerDay.toFixed(2)}R/day` +
+        (x.typicalHoldHours != null ? `, held ~${x.typicalHoldHours}h` : '')).join('\n') +
+      `\nMost R per day: ${bestTf.timeframe}. ` +
+      (bestTf.timeframe === 'M15 (live)'
+        ? 'The current timeframe still earns the most per day, even though it trades more often.'
+        : `A slower chart produced more per day here. Set GRANULARITY SECONDS=` +
+          `${Math.round((bestTf.barMinutes * 60))} to switch, and expect far fewer, longer trades.`);
+  }
+
   sendTelegram(
     `Backtest — ${backtest.days.toFixed(0)} days of real Deriv candles, ` +
     `${activeSymbols.length} symbols, threshold ${CONFIDENCE_THRESHOLD}%\n\n` +
@@ -884,7 +1136,8 @@ function reportBacktest() {
     `${active.expectancy >= 0 ? '+' : ''}${active.expectancy.toFixed(2)}R per trade\n` +
     `Typical hold ${humanDuration(active.hold.median)} ` +
     `(${humanDuration(active.hold.p25)} to ${humanDuration(active.hold.p75)})\n\n` +
-    `Stop and target comparison:\n${rows}\n\n${mgmtRows}${costBlock}${confBlock}${volBlock}${tsBlock}${oosBlock}\n\n${advice}`
+    `Stop and target comparison:\n${rows}\n\n${mgmtRows}${costBlock}${confBlock}` +
+    `${thBlock}${tfBlock}${volBlock}${tsBlock}${oosBlock}\n\n${advice}`
   );
 
   console.log(`[BACKTEST] active ${ACTIVE_VARIANT}: ${active.perDay.toFixed(2)}/day, ` +
@@ -1901,6 +2154,34 @@ if (process.env.PORT) {
           byTimeStop: digest(backtest.byTimeStop),
         };
       })(),
+      thresholdStudy: (() => {
+        const r = thresholdOutOfSample();
+        const row = (s) => (s ? {
+          trades: s.n, expectancyR: +s.exp.toFixed(3), winPct: +s.win.toFixed(1),
+          t: s.t == null ? null : +s.t.toFixed(2),
+        } : null);
+        return {
+          running: CONFIDENCE_THRESHOLD,
+          fullHistory: Object.fromEntries(r.table.map((x) => [String(x.threshold), {
+            trades: x.n, perDay: +x.perDay.toFixed(2),
+            winPct: +x.win.toFixed(1), expectancyR: +x.exp.toFixed(3),
+            t: x.t == null ? null : +x.t.toFixed(2),
+          }])),
+          chosenOnFirstHalf: r.pick ? r.pick.threshold : null,
+          firstHalf: r.pick ? row(r.pick.s) : null,
+          secondHalf: row(r.after),
+          secondHalfAtRunningThreshold: row(r.live),
+          // Positive diff with t above 2 is the only reading that justifies
+          // changing the setting. Anything less is noise wearing a decimal point.
+          beatsRunningSetting: r.beatsLive ? {
+            diffR: +r.beatsLive.diff.toFixed(3),
+            t: r.beatsLive.t == null ? null : +r.beatsLive.t.toFixed(2),
+            verdict: r.beatsLive.t != null && r.beatsLive.t > 2 ? 'CHANGE JUSTIFIED'
+              : r.beatsLive.t != null && r.beatsLive.t > 0 ? 'BETTER BUT UNPROVEN' : 'NO',
+          } : null,
+        };
+      })(),
+      timeframeStudy: timeframeStudy(),
       outOfSample: (() => {
         const o = outOfSampleResult();
         if (!o) return null;
@@ -1918,8 +2199,28 @@ if (process.env.PORT) {
         timeout: daily.timeout, netR: +daily.r.toFixed(2),
         dailyLimitR: DAILY_LOSS_LIMIT_R, paused: dailyLimitHit(),
       },
-      sinceStart: {
-        from: career.since, days: career.days, netR: +career.r.toFixed(2),
+      // career only accumulates when a UTC day rolls over, so on its own it
+      // silently excludes today - which made "today: 13 stops" sit next to
+      // "sinceStart: 11 stops" and look like a counting error. Today is added
+      // back here so this total always reconciles with liveOutcomes.
+      sinceStart: (() => {
+        const tp = career.tp + daily.tp;
+        const sl = career.sl + daily.sl;
+        const timeout = career.timeout + daily.timeout;
+        const n = tp + sl + timeout;
+        return {
+          from: career.since,
+          days: career.days + (daily.day ? 1 : 0),
+          trades: n,
+          tp, sl, timeout,
+          winPct: n ? +((100 * tp) / n).toFixed(1) : null,
+          netR: +(career.r + daily.r).toFixed(2),
+          expectancyR: n ? +((career.r + daily.r) / n).toFixed(3) : null,
+          note: 'includes today; resets when the process restarts',
+        };
+      })(),
+      completedDaysOnly: {
+        days: career.days, netR: +career.r.toFixed(2),
         tp: career.tp, sl: career.sl, timeout: career.timeout,
       },
       spikeAnalysis: Object.fromEntries(
