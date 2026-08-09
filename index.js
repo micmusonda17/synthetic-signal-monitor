@@ -46,6 +46,26 @@ function thresholdFor(label) {
 const GRANULARITY = Number(process.env.GRANULARITY_SECONDS || 900); // 900 = M15
 const ALERT_COOLDOWN_MS = Number(process.env.ALERT_COOLDOWN_MINUTES || 15) * 60 * 1000;
 
+// ---- Selection mode ----
+// The original design alerts the instant any symbol crosses its threshold. That
+// is first-come-first-served, not best-available: a 74 on V10 at 09:00 takes the
+// slot that an 88 on V75 would have filled at 09:20, and the position cap means
+// the good setup is then turned away.
+//
+// In selection mode the bot instead wakes on a fixed schedule, scores all ten
+// symbols at the same moment, ranks them, and takes only the strongest - and
+// only if it clears a floor. If nothing clears, it sends nothing. Silence is a
+// valid answer and the most common one at a high floor.
+//
+// Set DECISION_INTERVAL_MINUTES=0 to return to the original cross-triggered
+// behaviour.
+const DECISION_INTERVAL_MINUTES = Number(process.env.DECISION_INTERVAL_MINUTES ?? 240);
+const DECISION_TOP_K = Number(process.env.DECISION_TOP_K || 1);
+// Defaults to the ordinary threshold so turning selection mode on does not
+// silently also change how selective the bot is - one variable, one effect.
+const DECISION_FLOOR = Number(process.env.DECISION_FLOOR || CONFIDENCE_THRESHOLD);
+const SELECTION_MODE = DECISION_INTERVAL_MINUTES > 0;
+
 // Risk levels, expressed as multiples of ATR(14) so they scale with each
 // index's own volatility instead of assuming every symbol moves the same.
 const SL_ATR_MULT = Number(process.env.SL_ATR_MULT || 1.5);
@@ -739,6 +759,9 @@ function backtestSymbol(code, label, candles) {
   const cooldownBars = Math.max(1, Math.round(ALERT_COOLDOWN_MS / (GRANULARITY * 1000)));
   const liveThreshold = thresholdFor(label);
   const scores = scoreSeries(candles);
+  // Kept aside so the cross-symbol study can compare all ten at the same instant
+  // once the last symbol has landed.
+  keepForPortfolio(label, candles, scores);
   const replay = makeReplay(candles, scores, cooldownBars, liveThreshold, true);
 
   // Stop/target sweep, all with fixed stops so the comparison is clean.
@@ -818,6 +841,279 @@ function backtestSymbol(code, label, candles) {
     `[BACKTEST] ${label}: ${spanDays.toFixed(1)}d, active ${ACTIVE_VARIANT} -> ` +
     `${a.signals} signals TP=${a.tp} SL=${a.sl} timeout=${a.timeout}`
   );
+}
+
+// ---- Selection-mode study ----
+// Everything above measures one symbol at a time, which cannot answer the
+// question selection mode raises: if the bot waited, looked at all ten together
+// and took only the strongest, would it do better?
+//
+// Answering it needs the symbols aligned in time, so each one's scored series is
+// kept as typed arrays until the last symbol lands. Ten symbols at 20,000 bars
+// costs roughly 9MB this way; keeping the candle objects would cost forty times
+// that and the free tier would not survive it.
+const portfolioLab = { symbols: [], ran: false };
+
+function keepForPortfolio(label, candles, scores) {
+  const n = candles.length;
+  const time = new Float64Array(n);
+  const high = new Float64Array(n);
+  const low = new Float64Array(n);
+  const close = new Float64Array(n);
+  const atrArr = new Float64Array(n);
+  const conf = new Int16Array(n);
+  const dir = new Int8Array(n); // +1 buy, -1 sell, 0 no score
+
+  for (let i = 0; i < n; i++) {
+    time[i] = candles[i].time;
+    high[i] = candles[i].high;
+    low[i] = candles[i].low;
+    close[i] = candles[i].close;
+    const s = scores[i];
+    if (s) {
+      conf[i] = s.confidence;
+      dir[i] = s.direction === 'BUY' ? 1 : -1;
+      atrArr[i] = s.atrVal;
+    }
+  }
+  portfolioLab.symbols.push({ label, n, time, high, low, close, atr: atrArr, conf, dir });
+}
+
+// Candidate schedules. Expressed in bars so they follow GRANULARITY rather than
+// assuming M15.
+const DECISION_CADENCES = [
+  { key: 'every bar', bars: 1 },
+  { key: 'hourly', bars: Math.max(1, Math.round(3600 / GRANULARITY)) },
+  { key: '4-hourly', bars: Math.max(1, Math.round(14400 / GRANULARITY)) },
+  { key: 'daily', bars: Math.max(1, Math.round(86400 / GRANULARITY)) },
+];
+const DECISION_TOPKS = [1, 2, 3];
+const DECISION_FLOORS = [74, 78, 82];
+
+// One portfolio replay: walk the shared clock, manage whatever is open, and at
+// each scheduled moment take the strongest qualifying symbols up to the cap.
+function portfolioReplay({ cadenceBars, topK, floor, from = 0, to = 1 }) {
+  const syms = portfolioLab.symbols;
+  if (!syms.length) return null;
+
+  let start = Infinity, end = -Infinity;
+  for (const s of syms) {
+    if (s.n) { start = Math.min(start, s.time[0]); end = Math.max(end, s.time[s.n - 1]); }
+  }
+  if (!Number.isFinite(start)) return null;
+
+  const step = GRANULARITY;
+  const total = Math.floor((end - start) / step) + 1;
+  const gFrom = Math.floor(total * from);
+  const gTo = Math.floor(total * to);
+
+  // time -> bar index, per symbol. Built once and reused across the grid.
+  const index = syms.map((s) => {
+    const m = new Map();
+    for (let i = 0; i < s.n; i++) m.set(s.time[i], i);
+    return m;
+  });
+
+  const open = new Array(syms.length).fill(null);
+  const cfg = LIVE_MGMT.beAtR > 0 || LIVE_MGMT.trailAfterR > 0 ? LIVE_MGMT : null;
+  const costR = SL_ATR_MULT > 0 ? SPREAD_ATR / SL_ATR_MULT : 0;
+
+  let tp = 0, sl = 0, timeout = 0, sumR = 0, sumR2 = 0, rounds = 0, emptyRounds = 0;
+  const holds = [];
+
+  for (let g = gFrom; g < gTo; g++) {
+    const t = start + g * step;
+
+    // --- manage open positions ---
+    for (let k = 0; k < syms.length; k++) {
+      const o = open[k];
+      if (!o) continue;
+      const s = syms[k];
+      const i = index[k].get(t);
+      if (i === undefined) continue;
+      const long = o.dir === 1;
+      const held = g - o.g;
+      const hitSl = long ? s.low[i] <= o.sl : s.high[i] >= o.sl;
+      const hitTp = long ? s.high[i] >= o.tp : s.low[i] <= o.tp;
+      let out = null;
+      // Stop first: a candle spanning both levels gives no way to know which
+      // traded first, and assuming the loss is the honest default.
+      if (hitSl) out = 'SL';
+      else if (hitTp) out = 'TP';
+      else if (held >= TIME_STOP_BARS) out = 'TIME';
+
+      if (out) {
+        const exit = out === 'SL' ? o.sl : out === 'TP' ? o.tp : s.close[i];
+        const r = (long ? exit - o.entry : o.entry - exit) / o.risk - costR;
+        if (out === 'TP') tp++; else if (out === 'SL') sl++; else timeout++;
+        sumR += r; sumR2 += r * r;
+        if (out !== 'TIME') holds.push(held);
+        open[k] = null;
+      } else if (cfg) {
+        o.sl = manageStop({ dir: long ? 'BUY' : 'SELL', entry: o.entry, risk: o.risk, sl: o.sl },
+          { high: s.high[i], low: s.low[i] }, cfg);
+      }
+    }
+
+    // --- scheduled decision ---
+    if ((g - gFrom) % cadenceBars !== 0) continue;
+    rounds++;
+
+    const openCount = open.filter(Boolean).length;
+    const room = Math.min(MAX_OPEN_TRADES - openCount, topK);
+    if (room <= 0) { emptyRounds++; continue; }
+
+    const candidates = [];
+    for (let k = 0; k < syms.length; k++) {
+      if (open[k]) continue;
+      const s = syms[k];
+      const i = index[k].get(t);
+      if (i === undefined || !s.dir[i] || !s.atr[i]) continue;
+      // Each symbol keeps whatever extra selectivity it already carries.
+      const symFloor = Math.max(floor, thresholdFor(s.label));
+      if (s.conf[i] < symFloor) continue;
+      candidates.push({ k, i, conf: s.conf[i] });
+    }
+    if (!candidates.length) { emptyRounds++; continue; }
+
+    candidates.sort((a, b) => b.conf - a.conf);
+    for (const c of candidates.slice(0, room)) {
+      const s = syms[c.k];
+      const long = s.dir[c.i] === 1;
+      const risk = SL_ATR_MULT * s.atr[c.i];
+      const reward = TP_ATR_MULT * s.atr[c.i];
+      const entry = s.close[c.i];
+      open[c.k] = {
+        g, dir: s.dir[c.i], entry, risk,
+        sl: long ? entry - risk : entry + risk,
+        tp: long ? entry + reward : entry - reward,
+      };
+    }
+  }
+
+  const n = tp + sl + timeout;
+  if (!n) return null;
+  const days = ((gTo - gFrom) * step) / 86400;
+  const exp = sumR / n;
+  const varR = Math.max(sumR2 / n - exp * exp, 0);
+  return {
+    trades: n, tp, sl, timeout,
+    winPct: (100 * tp) / n,
+    expectancyR: exp,
+    se: n > 1 ? Math.sqrt(varR / n) : null,
+    t: n > 1 && varR > 0 ? exp / Math.sqrt(varR / n) : null,
+    tradesPerDay: n / Math.max(days, 1),
+    rPerDay: sumR / Math.max(days, 1),
+    rounds, emptyRounds,
+    quietPct: rounds ? (100 * emptyRounds) / rounds : 0,
+    medianHoldBars: holds.length ? holds.sort((a, b) => a - b)[Math.floor(holds.length / 2)] : null,
+  };
+}
+
+// The full comparison. Every schedule against every selectivity, judged on R per
+// day - because a setting that earns more per trade while trading a tenth as
+// often is a worse business, not a better one.
+//
+// 36 combinations is enough that the best will look good by luck, so the verdict
+// comes from the out-of-sample split rather than the winning row.
+const selectionStudy = { done: false, grid: [], chosen: null, oos: null, baseline: null, live: null };
+
+function runSelectionStudy() {
+  if (portfolioLab.ran || portfolioLab.symbols.length < 2) return;
+  portfolioLab.ran = true;
+
+  const combos = [];
+  for (const c of DECISION_CADENCES) {
+    for (const k of DECISION_TOPKS) {
+      for (const f of DECISION_FLOORS) combos.push({ cadence: c, topK: k, floor: f });
+    }
+  }
+
+  for (const combo of combos) {
+    const full = portfolioReplay({
+      cadenceBars: combo.cadence.bars, topK: combo.topK, floor: combo.floor,
+    });
+    if (!full) continue;
+    selectionStudy.grid.push({
+      key: `${combo.cadence.key}, top ${combo.topK}, floor ${combo.floor}`,
+      cadence: combo.cadence.key, cadenceBars: combo.cadence.bars,
+      topK: combo.topK, floor: combo.floor,
+      ...full,
+    });
+  }
+  if (!selectionStudy.grid.length) return;
+
+  // Closest portfolio equivalent of the original behaviour: react every bar,
+  // fill all three slots, no extra selectivity. Not identical to the live rule -
+  // that one is first-come rather than best-available - but it is the fairest
+  // like-for-like available from the same replay engine.
+  selectionStudy.baseline = selectionStudy.grid.find(
+    (g) => g.cadenceBars === 1 && g.topK === 3 && g.floor === 74) || null;
+
+  // What is actually configured to run.
+  selectionStudy.live = selectionStudy.grid.find(
+    (g) => g.cadenceBars === Math.round((DECISION_INTERVAL_MINUTES * 60) / GRANULARITY) &&
+           g.topK === DECISION_TOP_K && g.floor === DECISION_FLOOR) || null;
+
+  // Choose on the first half, judge on the second.
+  const first = [];
+  for (const combo of combos) {
+    const s = portfolioReplay({
+      cadenceBars: combo.cadence.bars, topK: combo.topK, floor: combo.floor, from: 0, to: 0.5,
+    });
+    if (s && s.trades >= 30) {
+      first.push({ combo, key: `${combo.cadence.key}, top ${combo.topK}, floor ${combo.floor}`, s });
+    }
+  }
+  if (first.length) {
+    const pick = first.reduce((a, b) => (b.s.rPerDay > a.s.rPerDay ? b : a));
+    const after = portfolioReplay({
+      cadenceBars: pick.combo.cadence.bars, topK: pick.combo.topK, floor: pick.combo.floor,
+      from: 0.5, to: 1,
+    });
+    const baseAfter = portfolioReplay({ cadenceBars: 1, topK: 3, floor: 74, from: 0.5, to: 1 });
+    // "Higher R per day" on its own is a coin flip: on pure noise the chosen
+    // schedule beat the baseline in a quarter of trial runs simply because one
+    // of two numbers has to be larger. So the verdict requires the gap to clear
+    // the noise in both.
+    //
+    // The standard error of R per day follows from the per-trade one: total R
+    // over the window has error se x n, and dividing by days gives
+    // se x tradesPerDay. The two schedules share many of the same trades, which
+    // makes the real error of the difference smaller than treating them as
+    // independent - so this test is conservative, which is the right direction.
+    let verdict = null;
+    if (after && baseAfter && after.se != null && baseAfter.se != null) {
+      const seA = after.se * after.tradesPerDay;
+      const seB = baseAfter.se * baseAfter.tradesPerDay;
+      const diff = after.rPerDay - baseAfter.rPerDay;
+      const se = Math.sqrt(seA * seA + seB * seB);
+      const t = se > 0 ? diff / se : null;
+      verdict = {
+        diffRPerDay: diff,
+        t,
+        beats: t != null && t > 2,
+        label: t == null ? 'not measurable'
+          : t > 2 ? 'BETTER'
+          : t < -2 ? 'WORSE'
+          : 'NO DIFFERENCE THAT CAN BE MEASURED',
+      };
+    }
+
+    selectionStudy.chosen = pick.key;
+    selectionStudy.oos = {
+      chosenOnFirstHalf: pick.key,
+      firstHalf: pick.s,
+      secondHalf: after,
+      baselineSecondHalf: baseAfter,
+      verdict,
+      beatsBaseline: verdict ? verdict.beats : null,
+    };
+  }
+
+  selectionStudy.done = true;
+  // The arrays are large and the study only runs once.
+  portfolioLab.symbols.length = 0;
 }
 
 // Reported once, after every symbol has been replayed, so the user gets a single
@@ -934,6 +1230,12 @@ function variantSummary(key) {
 function reportBacktest() {
   if (backtest.reported || !activeSymbols.length || backtest.done < activeSymbols.length) return;
   backtest.reported = true;
+  // Only possible now that every symbol has been scored and aligned.
+  try {
+    runSelectionStudy();
+  } catch (err) {
+    console.error('[SELECTION] study failed:', err.message);
+  }
 
   const active = variantSummary(ACTIVE_VARIANT);
   if (!active) return;
@@ -1128,6 +1430,51 @@ function reportBacktest() {
           `${Math.round((bestTf.barMinutes * 60))} to switch, and expect far fewer, longer trades.`);
   }
 
+  // The change that matters most to how the bot feels to use: does waiting and
+  // picking the best of ten beat reacting to whichever fires first?
+  let selBlock = '';
+  if (selectionStudy.grid.length) {
+    const top = [...selectionStudy.grid].sort((a, b) => b.rPerDay - a.rPerDay).slice(0, 5);
+    const fmt = (g) => `${g.key}: ${g.tradesPerDay.toFixed(1)}/day, ` +
+      `${g.expectancyR >= 0 ? '+' : ''}${g.expectancyR.toFixed(2)}R each, ` +
+      `${g.rPerDay >= 0 ? '+' : ''}${g.rPerDay.toFixed(2)}R/day, ` +
+      `quiet ${g.quietPct.toFixed(0)}% of rounds`;
+
+    selBlock = '\n\nWaiting and picking the best of all ten\n' +
+      `Best five of ${selectionStudy.grid.length} schedules tried:\n` +
+      top.map(fmt).join('\n');
+
+    if (selectionStudy.baseline) {
+      selBlock += `\n\nFor comparison, reacting every bar with no extra ` +
+        `selectivity:\n${fmt(selectionStudy.baseline)}`;
+    }
+    if (selectionStudy.live) {
+      selBlock += `\n\nWhat is configured to run now:\n${fmt(selectionStudy.live)}`;
+    }
+    const o = selectionStudy.oos;
+    if (o && o.secondHalf && o.baselineSecondHalf) {
+      selBlock += `\n\nChosen on the first half: ${o.chosenOnFirstHalf}\n` +
+        `On the second half it never saw: ` +
+        `${o.secondHalf.rPerDay >= 0 ? '+' : ''}${o.secondHalf.rPerDay.toFixed(2)}R/day ` +
+        `against ${o.baselineSecondHalf.rPerDay >= 0 ? '+' : ''}` +
+        `${o.baselineSecondHalf.rPerDay.toFixed(2)}R/day for reacting every bar.\n` +
+        (o.verdict
+          ? `Difference ${o.verdict.diffRPerDay >= 0 ? '+' : ''}` +
+            `${o.verdict.diffRPerDay.toFixed(2)}R/day, t ` +
+            `${o.verdict.t == null ? 'n/a' : o.verdict.t.toFixed(1)} (2.0 needed) — ` +
+            `${o.verdict.label}.\n` +
+            (o.verdict.beats
+              ? 'Waiting and choosing genuinely earns more, not just fewer alerts.'
+              : o.verdict.label === 'WORSE'
+                ? 'Waiting costs money. Fewer alerts are still worth something, but ' +
+                  'know that you are paying for them.'
+                : 'On the money, waiting and reacting are indistinguishable. The case ' +
+                  'for waiting is that it gives far fewer alerts for the same result, ' +
+                  'which is a fair reason to prefer it - just not a profit one.')
+          : 'Not enough second-half trades to judge.');
+    }
+  }
+
   sendTelegram(
     `Backtest — ${backtest.days.toFixed(0)} days of real Deriv candles, ` +
     `${activeSymbols.length} symbols, threshold ${CONFIDENCE_THRESHOLD}%\n\n` +
@@ -1137,7 +1484,7 @@ function reportBacktest() {
     `Typical hold ${humanDuration(active.hold.median)} ` +
     `(${humanDuration(active.hold.p25)} to ${humanDuration(active.hold.p75)})\n\n` +
     `Stop and target comparison:\n${rows}\n\n${mgmtRows}${costBlock}${confBlock}` +
-    `${thBlock}${tfBlock}${volBlock}${tsBlock}${oosBlock}\n\n${advice}`
+    `${thBlock}${selBlock}${tfBlock}${volBlock}${tsBlock}${oosBlock}\n\n${advice}`
   );
 
   console.log(`[BACKTEST] active ${ACTIVE_VARIANT}: ${active.perDay.toFixed(2)}/day, ` +
@@ -1602,9 +1949,12 @@ function reportSpikeLab() {
 const state = {};
 const labels = {};
 
-function evaluateSignal(code, label) {
+// Reads the current state of one symbol without deciding anything. Split out so
+// selection mode can score all ten at the same instant and compare them, which
+// is impossible when scoring and alerting are the same step.
+function assessSymbol(code) {
   const st = state[code];
-  if (st.candles.length < 55) return;
+  if (!st || st.candles.length < 55) return null;
   const closes = st.candles.map((c) => c.close);
   const ema20Series = ema(closes, 20);
   const ema50Series = ema(closes, 50);
@@ -1612,14 +1962,95 @@ function evaluateSignal(code, label) {
   const atrVal = atr(st.candles, 14);
   const price = closes.at(-1);
 
-  if (rsiVal === null || !Number.isFinite(price)) return;
+  if (rsiVal === null || !Number.isFinite(price)) return null;
   // Every level below is an ATR multiple, so without a usable ATR there is no
   // signal to send — better to stay quiet than to publish a stop of zero.
-  if (!atrVal || !Number.isFinite(atrVal) || atrVal <= 0) return;
+  if (!atrVal || !Number.isFinite(atrVal) || atrVal <= 0) return null;
 
   const { confidence, direction, parts } = scoreSignal({
     closes, ema20Series, ema50Series, rsiVal, atrVal, price,
   });
+  return { confidence, direction, parts, rsiVal, atrVal, price, ema20Series, ema50Series };
+}
+
+// Announces the daily stop once, so the quiet is explained rather than mistaken
+// for the bot having died.
+function announceDailyStopIfNeeded() {
+  if (dailyLimitHit() && !daily.announced) {
+    daily.announced = true;
+    sendTelegram(
+      `Daily loss limit reached: ${daily.r.toFixed(1)}R today ` +
+      `(limit ${DAILY_LOSS_LIMIT_R}R).\n\n` +
+      'No new signals until the UTC day rolls over. Open trades are still tracked ' +
+      'and will report as normal.'
+    );
+    console.log(`[RISK] daily limit hit at ${daily.r.toFixed(2)}R, pausing new entries`);
+  }
+}
+
+// Sends the instruction and opens the tracked position. The decision to trade
+// has already been made by the time this runs.
+function emitEntry(code, label, reading, note = '') {
+  const st = state[code];
+  const { confidence, direction, parts, rsiVal, atrVal, price, ema20Series, ema50Series } = reading;
+  const { entry, sl, tp, risk, reward } = levelsFor(direction, price, atrVal);
+  const d = st.decimals ?? 2;
+  const arrow = direction === 'BUY' ? '\u{1F7E2}' : '\u{1F534}';
+  const g = holdGuidance();
+
+  sendTelegram(
+    `${arrow} *${direction} ${label} NOW*\n\n` +
+    `Entry  ${entry.toFixed(d)}\n` +
+    `SL     ${sl.toFixed(d)}  (${direction === 'BUY' ? '-' : '+'}${risk.toFixed(d)})\n` +
+    `TP     ${tp.toFixed(d)}  (${direction === 'BUY' ? '+' : '-'}${reward.toFixed(d)})\n` +
+    `R:R    ${rrLabel}\n` +
+    `${positionSizeLine(risk, d)}\n\n` +
+    `Hold   about ${humanDuration(g.median)}, usually ${humanDuration(g.p25)} to ${humanDuration(g.p75)}\n` +
+    `Close  after ${humanDuration(TIME_STOP_BARS)} if neither level is hit\n` +
+    (BREAKEVEN_AT_R > 0
+      ? `Stop   moves to entry at +${BREAKEVEN_AT_R}R, then trails ${TRAIL_DISTANCE_R}R behind\n`
+      : '') +
+    '\n' +
+    `*Confidence ${confidence}%*\n` +
+    (note ? `${note}\n` : '') +
+    `RSI(14) ${rsiVal.toFixed(1)} · ATR(14) ${atrVal.toFixed(d)}\n` +
+    // Printed so the numbers can be checked against an M15 chart directly,
+    // rather than judged by eye from where two lines appear to sit.
+    `EMA20 ${ema20Series.at(-1).toFixed(d)} · EMA50 ${ema50Series.at(-1).toFixed(d)} ` +
+    `(${ema20Series.at(-1) > ema50Series.at(-1) ? 'EMA20 above' : 'EMA20 below'})\n` +
+    `Check on M15, EMA 20 and 50 on Close`,
+    { markdown: true }
+  );
+
+  st.open = {
+    direction, entry, sl, tp, risk, confidence,
+    bars: 0, openedAt: Date.now(), openBarTime: st.candles.at(-1).time,
+  };
+  rollDay();
+  daily.entries += 1;
+  console.log(
+    `[ALERT] ${label} ${direction} @ ${confidence}% ` +
+    `entry=${entry.toFixed(d)} sl=${sl.toFixed(d)} tp=${tp.toFixed(d)} ` +
+    `parts=${JSON.stringify(parts)}`
+  );
+  st.lastAlertAt = Date.now();
+  st.lastSignal = { direction, confidence, entry, sl, tp, at: Date.now() };
+}
+
+function evaluateSignal(code, label) {
+  const st = state[code];
+  const reading = assessSymbol(code);
+  if (!reading) return;
+  const { confidence, direction } = reading;
+
+  // In selection mode nothing is triggered here. The scores are kept up to date
+  // and the scheduled round decides, so a symbol crossing its threshold at an
+  // awkward moment cannot take the slot from a better one twenty minutes later.
+  if (SELECTION_MODE) {
+    st.lastDirection = direction;
+    st.lastConfidence = confidence;
+    return;
+  }
 
   const bar = thresholdFor(label);
   const strong = confidence >= bar;
@@ -1634,65 +2065,115 @@ function evaluateSignal(code, label) {
   const roomToTrade = openCount < MAX_OPEN_TRADES;
   const budgetLeft = !dailyLimitHit();
 
-  // Announce the daily stop once, so you know why the alerts went quiet rather
-  // than wondering whether the bot died.
-  if (!budgetLeft && !daily.announced) {
-    daily.announced = true;
-    sendTelegram(
-      `Daily loss limit reached: ${daily.r.toFixed(1)}R today ` +
-      `(limit ${DAILY_LOSS_LIMIT_R}R).\n\n` +
-      'No new signals until the UTC day rolls over. Open trades are still tracked ' +
-      'and will report as normal.'
-    );
-    console.log(`[RISK] daily limit hit at ${daily.r.toFixed(2)}R, pausing new entries`);
-  }
+  announceDailyStopIfNeeded();
 
   if (free && budgetLeft && roomToTrade && (crossedUp || flipped) && cooledDown) {
-    const { entry, sl, tp, risk, reward } = levelsFor(direction, price, atrVal);
-    const d = st.decimals ?? 2;
-    const arrow = direction === 'BUY' ? '\u{1F7E2}' : '\u{1F534}';
-    const g = holdGuidance();
-
-    sendTelegram(
-      `${arrow} *${direction} ${label} NOW*\n\n` +
-      `Entry  ${entry.toFixed(d)}\n` +
-      `SL     ${sl.toFixed(d)}  (${direction === 'BUY' ? '-' : '+'}${risk.toFixed(d)})\n` +
-      `TP     ${tp.toFixed(d)}  (${direction === 'BUY' ? '+' : '-'}${reward.toFixed(d)})\n` +
-      `R:R    ${rrLabel}\n` +
-      `${positionSizeLine(risk, d)}\n\n` +
-      `Hold   about ${humanDuration(g.median)}, usually ${humanDuration(g.p25)} to ${humanDuration(g.p75)}\n` +
-      `Close  after ${humanDuration(TIME_STOP_BARS)} if neither level is hit\n` +
-      (BREAKEVEN_AT_R > 0
-        ? `Stop   moves to entry at +${BREAKEVEN_AT_R}R, then trails ${TRAIL_DISTANCE_R}R behind\n`
-        : '') +
-      '\n' +
-      `*Confidence ${confidence}%*\n` +
-      `RSI(14) ${rsiVal.toFixed(1)} · ATR(14) ${atrVal.toFixed(d)}\n` +
-      // Printed so the numbers can be checked against an M15 chart directly,
-      // rather than judged by eye from where two lines appear to sit.
-      `EMA20 ${ema20Series.at(-1).toFixed(d)} · EMA50 ${ema50Series.at(-1).toFixed(d)} ` +
-      `(${ema20Series.at(-1) > ema50Series.at(-1) ? 'EMA20 above' : 'EMA20 below'})\n` +
-      `Check on M15, EMA 20 and 50 on Close`,
-      { markdown: true }
-    );
-
-    st.open = {
-      direction, entry, sl, tp, risk, confidence,
-      bars: 0, openedAt: Date.now(), openBarTime: st.candles.at(-1).time,
-    };
-    rollDay();
-    daily.entries += 1;
-    console.log(
-      `[ALERT] ${label} ${direction} @ ${confidence}% ` +
-      `entry=${entry.toFixed(d)} sl=${sl.toFixed(d)} tp=${tp.toFixed(d)} ` +
-      `parts=${JSON.stringify(parts)}`
-    );
-    st.lastAlertAt = Date.now();
-    st.lastSignal = { direction, confidence, entry, sl, tp, at: Date.now() };
+    emitEntry(code, label, reading);
   }
 
   st.lastDirection = direction;
   st.lastConfidence = confidence;
+}
+
+// ---- Scheduled decision round ----
+// Runs every DECISION_INTERVAL_MINUTES. Scores every symbol at the same instant,
+// keeps only those clearing the floor, ranks them, and takes the strongest few.
+// The whole point is that it is allowed to take nothing.
+const decisionLog = { rounds: 0, taken: 0, empty: 0, last: null };
+
+function humanInterval(minutes) {
+  if (minutes % 1440 === 0) return `${minutes / 1440} day${minutes === 1440 ? '' : 's'}`;
+  if (minutes % 60 === 0) return `${minutes / 60} hour${minutes === 60 ? '' : 's'}`;
+  return `${minutes} minutes`;
+}
+
+function runDecisionRound() {
+  rollDay();
+  announceDailyStopIfNeeded();
+
+  const openCount = Object.values(state).filter((s) => s.open).length;
+  const room = Math.min(MAX_OPEN_TRADES - openCount, DECISION_TOP_K);
+  const blocked = dailyLimitHit() ? 'daily loss limit' : room <= 0 ? 'position cap' : null;
+
+  const candidates = [];
+  for (const code of activeSymbols) {
+    const st = state[code];
+    if (!st || st.open) continue;
+    const reading = assessSymbol(code);
+    if (!reading) continue;
+    const label = labels[code] || code;
+    // The floor is whichever is stricter: the round's floor, or the symbol's own
+    // threshold. Boom and Crash keep their bump.
+    const floor = Math.max(DECISION_FLOOR, thresholdFor(label));
+    candidates.push({ code, label, reading, floor, qualifies: reading.confidence >= floor });
+  }
+
+  const qualified = candidates
+    .filter((c) => c.qualifies)
+    .sort((a, b) => b.reading.confidence - a.reading.confidence);
+
+  const strongest = candidates.length
+    ? candidates.reduce((a, b) => (b.reading.confidence > a.reading.confidence ? b : a))
+    : null;
+
+  decisionLog.rounds += 1;
+  decisionLog.last = {
+    at: Date.now(),
+    scanned: candidates.length,
+    qualified: qualified.length,
+    best: strongest
+      ? { label: strongest.label, confidence: strongest.reading.confidence, floor: strongest.floor }
+      : null,
+    blocked,
+    took: [],
+  };
+
+  if (blocked || !qualified.length) {
+    decisionLog.empty += 1;
+    const why = blocked
+      ? `held back by the ${blocked}`
+      : candidates.length
+        ? `best was ${decisionLog.last.best.label} at ${decisionLog.last.best.confidence}%, ` +
+          `floor ${decisionLog.last.best.floor}%`
+        : 'no symbol had enough data';
+    console.log(`[DECISION] nothing taken — ${why}`);
+    return;
+  }
+
+  const take = qualified.slice(0, Math.max(room, 0));
+  for (const c of take) {
+    const rank = qualified.length > 1
+      ? `Best of ${qualified.length} qualifying across ${candidates.length} symbols`
+      : `Only symbol clearing ${c.floor}% this round`;
+    emitEntry(c.code, c.label, c.reading, rank);
+    decisionLog.taken += 1;
+    decisionLog.last.took.push({ label: c.label, confidence: c.reading.confidence });
+  }
+  console.log(`[DECISION] scanned ${candidates.length}, qualified ${qualified.length}, ` +
+    `took ${take.map((c) => `${c.label}@${c.reading.confidence}`).join(', ')}`);
+}
+
+let decisionTimer = null;
+function startDecisionSchedule() {
+  if (!SELECTION_MODE || decisionTimer) return;
+  const ms = DECISION_INTERVAL_MINUTES * 60 * 1000;
+
+  // Align to the wall clock so rounds land at predictable times rather than
+  // wherever the process happened to restart. A four-hour interval then means
+  // 00:00, 04:00, 08:00 UTC and so on, which also makes the log readable.
+  const now = Date.now();
+  const firstDelay = ms - (now % ms);
+
+  console.log(`[DECISION] selection mode on: every ${DECISION_INTERVAL_MINUTES}m, ` +
+    `top ${DECISION_TOP_K}, floor ${DECISION_FLOOR}%. First round in ` +
+    `${Math.round(firstDelay / 60000)}m.`);
+
+  setTimeout(() => {
+    // Give the candle history a moment to fill on a cold start; a round that
+    // scores nothing is worse than a round three minutes late.
+    runDecisionRound();
+    decisionTimer = setInterval(runDecisionRound, ms);
+  }, firstDelay);
 }
 
 // ---- Open trade tracking ----
@@ -2020,13 +2501,21 @@ function connect() {
       console.log('Monitoring:', activeSymbols.map((s) => s.label).join(', '));
       sendTelegram(
         'Monitor live — watching ' + activeSymbols.map((s) => s.label).join(', ') +
-        `\nAlerting above ${CONFIDENCE_THRESHOLD}% confidence ` +
-        `(${SPIKE_THRESHOLD_BUMP > 0 ? `${CONFIDENCE_THRESHOLD + SPIKE_THRESHOLD_BUMP}% on Boom/Crash` : 'same on all'}), ` +
-        `SL ${SL_ATR_MULT}x ATR / TP ${TP_ATR_MULT}x ATR (${rrLabel}).`
+        (SELECTION_MODE
+          ? `\n\nSelection mode: every ${humanInterval(DECISION_INTERVAL_MINUTES)} the bot ` +
+            `scores all ${activeSymbols.length} symbols at once and takes ` +
+            `${DECISION_TOP_K === 1 ? 'only the strongest' : `the strongest ${DECISION_TOP_K}`}, ` +
+            `and only above ${DECISION_FLOOR}% ` +
+            `(${CONFIDENCE_THRESHOLD + SPIKE_THRESHOLD_BUMP}% on Boom/Crash).\n` +
+            'If nothing clears the bar, it sends nothing. Quiet days are expected.'
+          : `\nAlerting above ${CONFIDENCE_THRESHOLD}% confidence ` +
+            `(${SPIKE_THRESHOLD_BUMP > 0 ? `${CONFIDENCE_THRESHOLD + SPIKE_THRESHOLD_BUMP}% on Boom/Crash` : 'same on all'})`) +
+        `\nSL ${SL_ATR_MULT}x ATR / TP ${TP_ATR_MULT}x ATR (${rrLabel}).`
       );
       subscribe(activeSymbols);
       startSpikeLab(activeSymbols);
       startOtherMarketScan(all);
+      startDecisionSchedule();
       return;
     }
 
@@ -2132,6 +2621,16 @@ if (process.env.PORT) {
         costPerTradeR: +(SPREAD_ATR / SL_ATR_MULT).toFixed(4),
         rCostPer001Atr: +(0.01 / SL_ATR_MULT).toFixed(4),
       },
+      selection: SELECTION_MODE ? {
+        mode: 'scheduled ranking across all symbols',
+        everyMinutes: DECISION_INTERVAL_MINUTES,
+        takesTop: DECISION_TOP_K,
+        floor: DECISION_FLOOR,
+        roundsRun: decisionLog.rounds,
+        entriesTaken: decisionLog.taken,
+        roundsWithNothing: decisionLog.empty,
+        lastRound: decisionLog.last,
+      } : { mode: 'alerts on threshold cross, per symbol' },
       hold: holdGuidance(),
       backtest: {
         days: Math.round(backtest.days),
@@ -2182,6 +2681,33 @@ if (process.env.PORT) {
         };
       })(),
       timeframeStudy: timeframeStudy(),
+      selectionStudy: selectionStudy.done ? (() => {
+        const slim = (g) => (g ? {
+          key: g.key ?? null, trades: g.trades,
+          tradesPerDay: +g.tradesPerDay.toFixed(2),
+          winPct: +g.winPct.toFixed(1),
+          expectancyR: +g.expectancyR.toFixed(3),
+          rPerDay: +g.rPerDay.toFixed(3),
+          quietRoundsPct: +g.quietPct.toFixed(1),
+          t: g.t == null ? null : +g.t.toFixed(2),
+        } : null);
+        return {
+          best: [...selectionStudy.grid].sort((a, b) => b.rPerDay - a.rPerDay).slice(0, 8).map(slim),
+          configuredNow: slim(selectionStudy.live),
+          reactEveryBarBaseline: slim(selectionStudy.baseline),
+          outOfSample: selectionStudy.oos ? {
+            chosenOnFirstHalf: selectionStudy.oos.chosenOnFirstHalf,
+            secondHalf: slim(selectionStudy.oos.secondHalf),
+            baselineSecondHalf: slim(selectionStudy.oos.baselineSecondHalf),
+            verdict: selectionStudy.oos.verdict ? {
+              diffRPerDay: +selectionStudy.oos.verdict.diffRPerDay.toFixed(3),
+              t: selectionStudy.oos.verdict.t == null ? null : +selectionStudy.oos.verdict.t.toFixed(2),
+              label: selectionStudy.oos.verdict.label,
+            } : null,
+            beatsBaseline: selectionStudy.oos.beatsBaseline,
+          } : null,
+        };
+      })() : null,
       outOfSample: (() => {
         const o = outOfSampleResult();
         if (!o) return null;

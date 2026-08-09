@@ -19,6 +19,31 @@ Repo: `github.com/micmusonda17/synthetic-signal-monitor`
 - Auto-reconnects if the feed drops
 - Exposes everything it knows as JSON at `/` for inspection
 
+## Selection mode
+
+By default the bot no longer alerts the moment a symbol crosses its threshold.
+That was first-come-first-served rather than best-available: a 74 on V10 at 09:00
+took the slot an 88 on V75 would have filled at 09:20, and with a three-position
+cap the better setup was then turned away.
+
+Instead it wakes every four hours, scores all ten symbols at the same instant,
+ranks them, and takes only the strongest — and only if it clears the floor. **If
+nothing clears, it sends nothing.** Quiet rounds are the common case, not a
+fault.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `DECISION_INTERVAL_MINUTES` | `240` | How often to decide. `0` restores the original cross-triggered behaviour |
+| `DECISION_TOP_K` | `1` | How many symbols may be taken per round |
+| `DECISION_FLOOR` | same as `CONFIDENCE_THRESHOLD` | Minimum score to qualify. Boom/Crash keep their bump on top |
+
+Rounds are aligned to the wall clock, so a four-hour interval means 00:00, 04:00,
+08:00 UTC and so on regardless of when the process restarted.
+
+Whether this earns more than reacting every bar is measured, not assumed — see
+the selection study below. It reliably produces far fewer alerts; whether it
+produces more profit is a separate question the bot answers out loud.
+
 ## Signals
 
 Each alert is an instruction, not a hint:
@@ -88,6 +113,14 @@ health endpoint:
 | Volatility regime | Does trading into rising volatility help? | No — +0.108R vs +0.101R |
 | Time-stop sweep | What time limit is best? | No difference — 6/12/24/48 candles all within 0.004R |
 | Out-of-sample | Does the chosen setting survive unseen data? | Yes — "SL1 TP2 break-even at 0.5R" chosen on the first half held on the second |
+| Threshold sweep | How selective should the bot be? | Seven thresholds chosen on the first half, judged on the second; only recommends a change at t > 2 |
+| Timeframe study | Would H1 or H4 suit a small account better? | M15 history merged into slower candles, compared on R per day |
+| Selection study | Does waiting and picking the best of ten beat reacting? | 36 schedules replayed across all symbols on a shared clock, chosen on the first half, judged on the second |
+
+The selection study is the one to read before trusting selection mode. It reports
+the configured schedule, the react-every-bar baseline, and whether the difference
+between them clears t = 2 — because on ten random walks one of two numbers has to
+be larger, and "higher" is not the same as "better".
 
 The hold guidance printed in each alert uses real percentiles from this
 backtest, and is replaced by the bot's own closed trades once it has 20 of them.
