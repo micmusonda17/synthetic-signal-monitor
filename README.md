@@ -90,13 +90,13 @@ On startup the bot paginates 208 days of real candles per symbol out of Deriv
 replays the exact live rules over them — same score, same threshold, same
 cooldown, same one-position rule, same time stop, same stop management.
 
-Current reading, 2,323 trades over 208 days:
+Current reading, 2,321 trades over 208 days:
 
 ```
-Signals: 2324 (11.2/day across all symbols)
-Hit target: 848 · Hit stop: 1462 · Timed out: 13
-Win rate: 36.5%
-Expectancy: +0.101R per trade   (t ≈ 3.4)
+Signals: 2321 (11.1/day across all symbols)
+Hit target: 852 · Hit stop: 1456 · Timed out: 13
+Win rate: 36.7%
+Expectancy: +0.110R per trade   (t ≈ 3.7)
 ```
 
 At 1:2 reward-to-risk, break-even is a 33.3% win rate — losing two trades in
@@ -109,8 +109,8 @@ health endpoint:
 |---|---|---|
 | Structure scan | Does any simple lookback/hold rule have an edge? | No — 5,632 rules across 22 instruments, nothing survives multiple-testing correction |
 | Spike timing | Can Boom/Crash spikes be timed by waiting? | No — three of four are statistically memoryless |
-| Confidence study | Do higher scores produce better trades? | Suggestive ladder (0.042R → 0.342R) but t = 1.76, unproven |
-| Volatility regime | Does trading into rising volatility help? | No — +0.108R vs +0.101R |
+| Confidence study | Do higher scores produce better trades? | Suggestive ladder (0.045R → 0.342R) at t ≈ 2.2, but the out-of-sample threshold sweep rejects acting on it |
+| Volatility regime | Does trading into rising volatility help? | No — +0.126R vs +0.096R, within noise |
 | Time-stop sweep | What time limit is best? | No difference — 6/12/24/48 candles all within 0.004R |
 | Out-of-sample | Does the chosen setting survive unseen data? | Yes — "SL1 TP2 break-even at 0.5R" chosen on the first half held on the second |
 | Threshold sweep | How selective should the bot be? | Seven thresholds chosen on the first half, judged on the second; only recommends a change at t > 2 |
@@ -124,6 +124,18 @@ be larger, and "higher" is not the same as "better".
 
 The hold guidance printed in each alert uses real percentiles from this
 backtest, and is replaced by the bot's own closed trades once it has 20 of them.
+
+## A bug worth knowing about
+
+Until 9 August the historical analysis re-ran on every WebSocket reconnect and
+added its results to the same accumulators. Nothing reset them, so the totals
+multiplied by the number of reconnections — eight on 7 August, which is how the
+bot came to report 18,590 trades when the truth was 2,321.
+
+Per-trade figures were unaffected (they are ratios), but every count and every
+t-statistic was inflated: duplicating a sample eight times multiplies t by 2.8.
+`beginHistory` now declines once the analysis has been reported, and a
+regression test reproduces the old behaviour to confirm the guard holds.
 
 ## Known unknown: spread
 
@@ -160,7 +172,7 @@ All behaviour is environment variables. No code change is needed to retune.
 |---|---|---|
 | `SL_ATR_MULT` | `1.5` | Stop distance in ATRs (**Render runs `1`**) |
 | `TP_ATR_MULT` | `3.0` | Target distance in ATRs (**Render runs `2`**) |
-| `BREAKEVEN_AT_R` | `0` (off) | Move stop to entry once this far in profit |
+| `BREAKEVEN_AT_R` | `0` (off) | Move stop to entry once this far in profit (**Render runs `0.5`**) |
 | `TRAIL_AFTER_R` | `0` (off) | Start trailing once this far in profit |
 | `TRAIL_DISTANCE_R` | `1` | How far behind the high-water mark the trail sits |
 | `TIME_STOP_BARS` | `24` | Candles (6h) before a stale trade is called |

@@ -1830,7 +1830,11 @@ function onSpikeError(code, errorCode) {
   finishSpikeSymbol(code);
 }
 
+let spikeLabStarted = false;
 function startSpikeLab(list) {
+  // One-time, like the rest of the startup analysis.
+  if (spikeLabStarted) return;
+  spikeLabStarted = true;
   // Set SPIKE_BATCHES to 0 once the spike question is settled. It costs several
   // hundred requests per restart, and running it alongside candle pagination is
   // what makes the two collectively trip Deriv's rate limiter.
@@ -2336,7 +2340,13 @@ function subscribe(list) {
 // Picks a spread of real instruments and asks for their candles. No subscribe,
 // so nothing streams and nothing can ever be traded from this list - the data
 // arrives once, gets scanned, and is discarded.
+let otherScanStarted = false;
 function startOtherMarketScan(available) {
+  // Same one-time rule as the history analysis. Without this a reconnect reset
+  // scanStats.expected from 22 back to 10 while scanStats.done kept its old
+  // value, which would let the scan report itself finished on partial results.
+  if (otherScanStarted) return;
+  otherScanStarted = true;
   scanStats.expected = activeSymbols.length;
   if (!SCAN_OTHER_MARKETS) return;
 
@@ -2409,7 +2419,22 @@ function onHistoryError(code, errorCode) {
 }
 
 // Called with the first, subscribed batch. Everything after this is pagination.
+// The historical analysis is a one-time startup job, but the WebSocket drops
+// regularly - the Deriv feed reconnected eight times in a single day on Aug 7 -
+// and every reconnect re-subscribes, which used to re-fetch the history and run
+// the whole backtest again into the SAME accumulators.
+//
+// Nothing reset them, so the totals simply grew. After eight reconnects the bot
+// reported 18,590 trades over 208 days: the true 2,321, counted eight times. The
+// per-trade figures survived that (they are ratios) but every count, every
+// signals-per-day and every t-statistic was inflated by the repetition, and a
+// t-statistic that grows with the square root of a duplicated sample is the most
+// dangerous kind of wrong - it looks like mounting evidence.
+//
+// So the analysis runs once per process. A reconnect resubscribes to live prices
+// and nothing else, which also spares Deriv 200 needless history requests.
 function beginHistory(code, label, candles) {
+  if (backtest.reported || histLab.symbols[code]) return;
   histLab.symbols[code] = {
     label, buffer: candles.slice(), batches: 1, oldest: candles[0]?.time ?? null, done: false,
   };
