@@ -569,6 +569,18 @@ const THRESHOLD_VARIANTS = (() => {
   return [...set].sort((a, b) => a - b);
 })();
 
+// The single 50/50 split answered the threshold question once, on one draw, and
+// picked from seven candidates using a first half in which the top thresholds had
+// barely 130 trades. That is thin enough that the winner is mostly noise, which
+// is why it chose 84 and then fell over on the second half.
+//
+// Walk-forward instead: cut the history into contiguous folds, and for each fold
+// choose the threshold using only the folds before it, then measure on the fold
+// itself. Six folds gives five separate choices judged on five separate stretches
+// of unseen data, and the results pool into one verdict instead of resting on a
+// single coin flip.
+const WALK_FOLDS = Number(process.env.WALK_FOLDS || 6);
+
 // Would a slower chart suit a small account better? Holding fewer, longer trades
 // is not obviously better or worse - it trades signal count for signal quality,
 // and the only way to know which wins is to measure both. M15 candles are
@@ -610,6 +622,11 @@ const backtest = {
     inSample: Object.fromEntries(THRESHOLD_VARIANTS.map((t) => [String(t), blankVariant()])),
     outSample: Object.fromEntries(THRESHOLD_VARIANTS.map((t) => [String(t), blankVariant()])),
   },
+  // One accumulator per fold per candidate threshold. Expectancy is sumR/n and
+  // both are additive, so folds can be merged by simple addition to form any
+  // training window without replaying anything.
+  walk: Array.from({ length: WALK_FOLDS }, () =>
+    Object.fromEntries(THRESHOLD_VARIANTS.map((t) => [String(t), blankVariant()]))),
   split: {
     inSample: Object.fromEntries(SPLIT_COMBOS.map((c) => [c.key, blankVariant()])),
     outSample: Object.fromEntries(SPLIT_COMBOS.map((c) => [c.key, blankVariant()])),
@@ -668,7 +685,20 @@ function scoreSeries(candles) {
 function makeReplay(candles, scores, cooldownBars, defaultThreshold, studies) {
   return (slMult, tpMult, mgmt, acc, from = 60, to = candles.length,
           timeStop = TIME_STOP_BARS, threshold = defaultThreshold) => {
-    let lastConf = 0, lastDir = null, lastAlertBar = -1e9, open = null;
+    // An entry fires on a threshold CROSS, which depends on what the score was
+    // on the previous bar. Starting a segment with lastConf = 0 makes the first
+    // qualifying bar look like a fresh cross even when the score had already
+    // been high for hours, manufacturing one entry per segment boundary.
+    //
+    // Small - it inflated a six-fold split by about 0.1% - but it is a bias
+    // rather than noise, and it pushes in the direction of flattering whichever
+    // setting is being tested. Seeding from the bar before the segment removes
+    // it. For a full replay from bar 60 there is no earlier score, so this
+    // leaves the original behaviour untouched.
+    const seedScore = from > 0 ? scores[from - 1] : null;
+    let lastConf = seedScore ? seedScore.confidence : 0;
+    let lastDir = seedScore ? seedScore.direction : null;
+    let lastAlertBar = -1e9, open = null;
 
     for (let i = from; i < to; i++) {
       const bar = candles[i];
@@ -804,6 +834,19 @@ function backtestSymbol(code, label, candles) {
       60, mid, TIME_STOP_BARS, applied);
     replay(SL_ATR_MULT, TP_ATR_MULT, liveCfg, backtest.thresholdSplit.outSample[k],
       mid, candles.length, TIME_STOP_BARS, applied);
+  }
+
+  // Walk-forward folds. Each covers a sixth of the history, so all six together
+  // cost about the same as one full replay per threshold.
+  const walkSpan = candles.length - 60;
+  for (let f = 0; f < WALK_FOLDS; f++) {
+    const a = 60 + Math.floor((walkSpan * f) / WALK_FOLDS);
+    const bEnd = 60 + Math.floor((walkSpan * (f + 1)) / WALK_FOLDS);
+    if (bEnd - a < 50) continue;
+    for (const t of THRESHOLD_VARIANTS) {
+      replay(SL_ATR_MULT, TP_ATR_MULT, liveCfg, backtest.walk[f][String(t)],
+        a, bEnd, TIME_STOP_BARS, t + symbolOffset);
+    }
   }
 
   const spanDays = (candles.at(-1).time - candles[0].time) / 86400;
@@ -1188,6 +1231,133 @@ function thresholdOutOfSample() {
   return { table, pick, after, live, beatsLive };
 }
 
+// Shared statistics for an accumulator: mean R, its standard error, and the
+// t-statistic against zero.
+function accStat(acc) {
+  const n = acc.tp + acc.sl + acc.timeout;
+  if (!n) return null;
+  const exp = acc.sumR / n;
+  const varR = Math.max(acc.sumR2 / n - exp * exp, 0);
+  const se = n > 1 ? Math.sqrt(varR / n) : null;
+  return { n, exp, win: (100 * acc.tp) / n, se, t: se > 0 ? exp / se : null };
+}
+
+function mergeAccs(list) {
+  const out = blankVariant();
+  for (const a of list) {
+    out.signals += a.signals; out.tp += a.tp; out.sl += a.sl; out.timeout += a.timeout;
+    out.sumR += a.sumR; out.sumR2 += a.sumR2;
+  }
+  return out;
+}
+
+// Is each confidence band actually making or losing money?
+//
+// The existing table compares bands to each other, which answers "is the top
+// better than the bottom" - a different question from "is the bottom losing".
+// Once the spread was charged, the 74-77 band showed -0.015R and it became
+// tempting to read that as "these trades cost money, cut them". Whether that
+// reading survives depends entirely on the standard error, so this reports it.
+function confidenceBandTest() {
+  return CONFIDENCE_BUCKETS.map((bk) => {
+    const s = accStat(backtest.byConfidence[bk.key]);
+    if (!s || s.n < 40) return null;
+    return {
+      band: bk.key, trades: s.n,
+      winPct: +s.win.toFixed(1),
+      expectancyR: +s.exp.toFixed(3),
+      standardError: s.se == null ? null : +s.se.toFixed(3),
+      t: s.t == null ? null : +s.t.toFixed(2),
+      verdict: s.t == null ? 'not measurable'
+        : s.t > 2 ? 'MAKES MONEY'
+        : s.t < -2 ? 'LOSES MONEY'
+        : 'INDISTINGUISHABLE FROM ZERO',
+    };
+  }).filter(Boolean);
+}
+
+// Walk-forward threshold selection. For each fold after the first, the threshold
+// is chosen using only earlier folds and then measured on the fold itself. The
+// results pool across folds, so the verdict rests on five separate decisions
+// judged on five separate stretches rather than on one split.
+//
+// The comparison that matters is against doing nothing: the same folds, with the
+// threshold held at whatever is configured.
+function walkForwardThreshold() {
+  if (!backtest.walk || backtest.walk.length < 2) return null;
+  const fixedKey = String(CONFIDENCE_THRESHOLD);
+  const folds = [];
+  const chosenAccs = [], fixedAccs = [];
+
+  for (let f = 1; f < backtest.walk.length; f++) {
+    // Train on every fold before this one.
+    let best = null;
+    for (const t of THRESHOLD_VARIANTS) {
+      const train = accStat(mergeAccs(backtest.walk.slice(0, f).map((w) => w[String(t)])));
+      // A threshold that barely traded in training has not earned the right to
+      // be chosen, however flattering its average looks.
+      if (!train || train.n < 100) continue;
+      if (!best || train.exp > best.trainExp) best = { threshold: t, trainExp: train.exp, trainN: train.n };
+    }
+    if (!best) continue;
+
+    const testChosen = backtest.walk[f][String(best.threshold)];
+    const testFixed = backtest.walk[f][fixedKey];
+    const sc = accStat(testChosen);
+    const sf = accStat(testFixed);
+    if (!sc || !sf) continue;
+
+    chosenAccs.push(testChosen);
+    fixedAccs.push(testFixed);
+    folds.push({
+      fold: f + 1,
+      chose: best.threshold,
+      trainedOnTrades: best.trainN,
+      testedOnTrades: sc.n,
+      chosenExpectancyR: +sc.exp.toFixed(3),
+      fixedExpectancyR: +sf.exp.toFixed(3),
+      chosenBetter: sc.exp > sf.exp,
+    });
+  }
+  if (!folds.length) return null;
+
+  const chosen = accStat(mergeAccs(chosenAccs));
+  const fixed = accStat(mergeAccs(fixedAccs));
+  let verdict = null;
+  if (chosen && fixed && chosen.se != null && fixed.se != null) {
+    const diff = chosen.exp - fixed.exp;
+    // The two sets overlap heavily, so treating them as independent overstates
+    // the error of the difference. That makes this harder to pass, which is the
+    // direction to err in.
+    const se = Math.sqrt(chosen.se ** 2 + fixed.se ** 2);
+    const t = se > 0 ? diff / se : null;
+    verdict = {
+      diffR: +diff.toFixed(3),
+      t: t == null ? null : +t.toFixed(2),
+      label: t == null ? 'not measurable'
+        : t > 2 ? 'CHANGING THE THRESHOLD HELPS'
+        : t < -2 ? 'CHANGING THE THRESHOLD HURTS'
+        : 'NO DIFFERENCE THAT CAN BE MEASURED',
+    };
+  }
+
+  return {
+    folds: backtest.walk.length,
+    decisions: folds.length,
+    foldsWhereChoosingWon: folds.filter((f) => f.chosenBetter).length,
+    perFold: folds,
+    pooledChosen: chosen ? {
+      trades: chosen.n, expectancyR: +chosen.exp.toFixed(3),
+      t: chosen.t == null ? null : +chosen.t.toFixed(2),
+    } : null,
+    pooledFixed: fixed ? {
+      trades: fixed.n, expectancyR: +fixed.exp.toFixed(3),
+      t: fixed.t == null ? null : +fixed.t.toFixed(2),
+    } : null,
+    verdict,
+  };
+}
+
 // Does a slower chart suit a small account better? Compared on R per day rather
 // than R per trade, because a setting that returns twice as much per trade while
 // producing a tenth as many trades is a worse business, not a better one.
@@ -1430,6 +1600,40 @@ function reportBacktest() {
           `${Math.round((bestTf.barMinutes * 60))} to switch, and expect far fewer, longer trades.`);
   }
 
+  // Two questions that look like one. "Is the weakest band losing money?" and
+  // "does cutting it help?" have different answers if the band sits at zero:
+  // removing zero-expectancy trades raises the average without adding anything
+  // to the total. Reporting them side by side stops that being mistaken for a
+  // contradiction in the data.
+  const bands = confidenceBandTest();
+  let bandBlock = '';
+  if (bands.length) {
+    bandBlock = '\n\nIs each confidence band making or losing money?\n' +
+      bands.map((x) => `${x.band}: ${x.trades} trades, ` +
+        `${x.expectancyR >= 0 ? '+' : ''}${x.expectancyR.toFixed(3)}R ` +
+        `± ${x.standardError == null ? '?' : x.standardError.toFixed(3)}, ` +
+        `t ${x.t == null ? 'n/a' : x.t.toFixed(1)} — ${x.verdict}`).join('\n');
+  }
+
+  const wf = walkForwardThreshold();
+  let wfBlock = '';
+  if (wf && wf.verdict) {
+    wfBlock = `\n\nThreshold, tested properly (${wf.decisions} choices, each judged on ` +
+      `history it was not chosen from):\n` +
+      wf.perFold.map((f) => `Fold ${f.fold}: chose ${f.chose}%, got ` +
+        `${f.chosenExpectancyR >= 0 ? '+' : ''}${f.chosenExpectancyR.toFixed(3)}R vs ` +
+        `${f.fixedExpectancyR >= 0 ? '+' : ''}${f.fixedExpectancyR.toFixed(3)}R for leaving it alone`).join('\n') +
+      `\nChoosing won in ${wf.foldsWhereChoosingWon} of ${wf.decisions} folds.` +
+      (wf.pooledChosen && wf.pooledFixed
+        ? `\nPooled: choosing ${wf.pooledChosen.expectancyR >= 0 ? '+' : ''}` +
+          `${wf.pooledChosen.expectancyR.toFixed(3)}R over ${wf.pooledChosen.trades} trades, ` +
+          `leaving it alone ${wf.pooledFixed.expectancyR >= 0 ? '+' : ''}` +
+          `${wf.pooledFixed.expectancyR.toFixed(3)}R over ${wf.pooledFixed.trades}.`
+        : '') +
+      `\nDifference ${wf.verdict.diffR >= 0 ? '+' : ''}${wf.verdict.diffR.toFixed(3)}R, ` +
+      `t ${wf.verdict.t == null ? 'n/a' : wf.verdict.t.toFixed(1)} (2.0 needed) — ${wf.verdict.label}.`;
+  }
+
   // The change that matters most to how the bot feels to use: does waiting and
   // picking the best of ten beat reacting to whichever fires first?
   let selBlock = '';
@@ -1484,7 +1688,8 @@ function reportBacktest() {
     `Typical hold ${humanDuration(active.hold.median)} ` +
     `(${humanDuration(active.hold.p25)} to ${humanDuration(active.hold.p75)})\n\n` +
     `Stop and target comparison:\n${rows}\n\n${mgmtRows}${costBlock}${confBlock}` +
-    `${thBlock}${selBlock}${tfBlock}${volBlock}${tsBlock}${oosBlock}\n\n${advice}`
+    `${bandBlock}${wfBlock}${thBlock}${selBlock}${tfBlock}${volBlock}${tsBlock}${oosBlock}` +
+    `\n\n${advice}`
   );
 
   console.log(`[BACKTEST] active ${ACTIVE_VARIANT}: ${active.perDay.toFixed(2)}/day, ` +
@@ -2705,6 +2910,8 @@ if (process.env.PORT) {
           } : null,
         };
       })(),
+      confidenceBandTest: confidenceBandTest(),
+      walkForwardThreshold: walkForwardThreshold(),
       timeframeStudy: timeframeStudy(),
       selectionStudy: selectionStudy.done ? (() => {
         const slim = (g) => (g ? {

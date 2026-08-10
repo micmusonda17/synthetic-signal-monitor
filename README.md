@@ -15,7 +15,7 @@ Repo: `github.com/micmusonda17/synthetic-signal-monitor`
 - Sends a direct BUY/SELL instruction with entry, stop, target, position size
   and expected holding time
 - Tracks each trade to its conclusion and reports the outcome
-- Re-runs six self-checks on 208 days of real history at every startup
+- Runs eleven self-checks on 208 days of real history, once per start
 - Auto-reconnects if the feed drops
 - Exposes everything it knows as JSON at `/` for inspection
 
@@ -102,20 +102,22 @@ Expectancy: +0.110R per trade   (t ≈ 3.7)
 At 1:2 reward-to-risk, break-even is a 33.3% win rate — losing two trades in
 three is the designed behaviour, not a fault.
 
-Six independent studies run alongside the backtest and are reported on the
+Eleven independent studies run alongside the backtest and are reported on the
 health endpoint:
 
 | Study | Question | Current answer |
 |---|---|---|
 | Structure scan | Does any simple lookback/hold rule have an edge? | No — 5,632 rules across 22 instruments, nothing survives multiple-testing correction |
 | Spike timing | Can Boom/Crash spikes be timed by waiting? | No — three of four are statistically memoryless |
-| Confidence study | Do higher scores produce better trades? | Suggestive ladder (0.045R → 0.342R) at t ≈ 2.2, but the out-of-sample threshold sweep rejects acting on it |
+| Confidence study | Do higher scores produce better trades? | Suggestive ladder, but both the threshold sweep and the walk-forward test reject acting on it |
 | Volatility regime | Does trading into rising volatility help? | No — +0.126R vs +0.096R, within noise |
 | Time-stop sweep | What time limit is best? | No difference — 6/12/24/48 candles all within 0.004R |
 | Out-of-sample | Does the chosen setting survive unseen data? | Yes — "SL1 TP2 break-even at 0.5R" chosen on the first half held on the second |
 | Threshold sweep | How selective should the bot be? | Seven thresholds chosen on the first half, judged on the second; only recommends a change at t > 2 |
 | Timeframe study | Would H1 or H4 suit a small account better? | M15 history merged into slower candles, compared on R per day |
 | Selection study | Does waiting and picking the best of ten beat reacting? | 36 schedules replayed across all symbols on a shared clock, chosen on the first half, judged on the second |
+| Band test | Is each confidence band making or losing money? | Each band tested against zero directly, with its standard error, rather than against the other bands |
+| Walk-forward threshold | Does changing the threshold help, tested properly? | Six folds; the threshold is chosen on everything before each fold and measured on the fold itself, pooled across five decisions |
 
 The selection study is the one to read before trusting selection mode. It reports
 the configured schedule, the react-every-bar baseline, and whether the difference
@@ -139,11 +141,20 @@ regression test reproduces the old behaviour to confirm the guard holds.
 
 ## Known unknown: spread
 
-`SPREAD_ATR` is currently `0`, meaning all figures above are gross of trading
-cost. At a 1× ATR stop, every 0.01 ATR of spread costs 0.010R per trade, so a
-spread of 0.10 × ATR would erase the entire measured edge. Read the spread off
-MT5, divide by the ATR shown in an alert, and set `SPREAD_ATR` to that number —
-the backtest then reports net expectancy.
+## Spread: measured
+
+Deriv publishes its spreads at deriv.com/trading-specifications. Volatility 75
+shows a minimum spread of 17.27 points and a target of 0.03%. Divided by ATR —
+recoverable from any alert, since the stop distance *is* 1 × ATR — that comes to
+0.043 to 0.060 across V75, Boom 500 and Boom 1000.
+
+`SPREAD_ATR` is set to `0.06`, slightly conservative. At a 1× ATR stop that
+costs 0.060R per trade, which takes the measured edge from +0.110R gross to
+about +0.050R net and drops its t-statistic from 3.7 to 2.1.
+
+Spread cost in R is spread divided by stop size, so a wider stop dilutes it. The
+stop/target sweep is charged spread inside the replay, so its ranking is already
+net of cost and may now prefer a wider stop than the one configured.
 
 ## Configuration
 
@@ -206,6 +217,7 @@ clears it on about 93%.
 | `HISTORY_REQUEST_MS` | `1500` | Pacing between history requests; widens automatically on rate limit |
 | `HISTORY_MAX_RETRIES` | `6` | Give up on a symbol after this many failures |
 | `SPIKE_BATCHES` | `80` | Tick batches per Boom/Crash symbol (**Render runs `0`** — the question is settled) |
+| `WALK_FOLDS` | `6` | Folds for the walk-forward threshold study |
 | `SPIKE_MIN_GAPS` | `80` | Minimum spike intervals before the memorylessness test will rule either way |
 | `SPIKE_MULT` | `8` | How many typical moves defines a spike |
 | `SCAN_OTHER_MARKETS` | `true` | Also run the structure scan on forex and commodities as a control |
